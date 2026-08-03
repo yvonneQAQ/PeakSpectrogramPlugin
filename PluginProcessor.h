@@ -93,7 +93,7 @@ float smoothingCoeff = 0.9f;
 
 // Top 10 result
 std::array<float, kNumNoisyPeaks> topFrequenciesHz {};
-std::array<float, kNumNoisyPeaks> topMagnitudes {};
+std::array<float, kNumNoisyPeaks> topResidualsDb {};
 mutable juce::SpinLock fftLock;
 
     // ⭐⭐⭐ 现在新增的平滑相关成员 ⭐⭐⭐
@@ -104,6 +104,7 @@ double currentSampleRate = 44100.0;
 
 // 在 AudioPluginAudioProcessor.h 里 public 区加：
 void getSpectrumCopy (std::array<float, kFftSize / 2>& dest) const;
+// Copies the full residual spectrum for the editor's spectral-flux onset detector.
 void getResidualCopy (std::array<float, kFftSize / 2>& dest) const;
 void getTopPeaksCopy (std::array<float, kNumNoisyPeaks>& freqs, std::array<float, kNumNoisyPeaks>& mags) const;
 void setLiveFrozenMidiChord (const std::array<float, kNumNoisyPeaks>& freqsHz, bool useQuarterToneMode);

@@ -205,7 +205,7 @@ void AudioPluginAudioProcessor::getTopPeaksCopy (std::array<float, kNumNoisyPeak
     for (int i = 0; i < kNumNoisyPeaks; ++i)
     {
         freqsHz[(size_t) i]       = topFrequenciesHz[(size_t) i];   // runFftAndFindPeaks 填的 noisy peaks 频率
-        residualDbOut[(size_t) i] = topMagnitudes[(size_t) i];      // “高出 envelope 的 dB”
+        residualDbOut[(size_t) i] = topResidualsDb[(size_t) i];     // Raw dB above the envelope.
     }
 }
 
@@ -433,7 +433,7 @@ void AudioPluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPer
     fftBuffer.fill (0.0f);
     magnitudeSpectrum.fill (0.0f);
     topFrequenciesHz.fill (0.0f);
-    topMagnitudes.fill (0.0f);
+    topResidualsDb.fill (0.0f);
     smoothedMagnitudes.fill (0.0f);
     smoothedMagnitudesDb.fill (0.0f);
     pendingLiveMidiNotes.clear();
@@ -557,6 +557,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             const auto totalEnergy = leftEnergy + rightEnergy;
 
             stereoPanAvailable.store (true);
+            // Normalised stereo energy balance: -1 = left, 0 = centre, +1 = right.
             stereoPanEnergy.store (totalEnergy > 1.0e-12
                                      ? (float) juce::jlimit (-1.0, 1.0, (rightEnergy - leftEnergy) / totalEnergy)
                                      : 0.0f);
@@ -662,6 +663,8 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
         currentResidualDb[(size_t) bin] = currentSpectrumDb[(size_t) bin]
                                         - currentEnvelopeDb[(size_t) bin];
 
+    // Publish envelope and residual as thread-safe snapshots. The editor reads
+    // residualDb on the message thread for automatic spectral-flux detection.
     {
         const juce::SpinLock::ScopedLockType lock (fftLock);
         envelopeDb = currentEnvelopeDb;
@@ -740,8 +743,21 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
         candidates.push_back ({ weightedResidualScore (residual, hz), residual, bin });
     }
 
+    // Reuse the main residual spectrum for bass harmonic support. Zero-padding
+    // the same 2048-sample frame creates denser bins but no true frequency
+    // resolution, while requiring another FFT on the audio thread.
     if (useBassBoost)
     {
+        static constexpr float kBassHarmonicSearchMinHz = 40.0f;
+        static constexpr float kBassHarmonicSearchMaxHz = 170.0f;
+        static constexpr float kMinFundamentalResidualDb = 1.4f;
+        static constexpr float kMinHarmonicResidualDb = 1.2f;
+        static constexpr float kMinBassSalience = 3.9f;
+        static constexpr float kFundamentalSalienceWeight = 0.82f;
+        static constexpr float kBassHarmonicBonusWeight = 0.42f;
+
+        // Empirical ranking weights tuned for bass fundamentals and their
+        // second and third harmonics.
         static constexpr float harmonicWeights[] = { 0.0f, 0.0f, 0.44f, 0.24f };
 
         const auto strongestResidualNearBin = [&currentResidualDb] (int centerBin)
@@ -758,26 +774,28 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
 
         const int lowBinMin = juce::jlimit (1,
                                              numBins - 2,
-                                             (int) std::ceil (40.0f * (float) kFftSize
+                                             (int) std::ceil (kBassHarmonicSearchMinHz * (float) kFftSize
                                                               / (float) currentSampleRate));
         const int lowBinMax = juce::jlimit (lowBinMin,
                                              numBins - 2,
-                                             (int) std::floor (170.0f * (float) kFftSize
+                                             (int) std::floor (kBassHarmonicSearchMaxHz * (float) kFftSize
                                                                / (float) currentSampleRate));
 
+        // Require a visible low-frequency local peak plus support from its
+        // second or third harmonic to reject broadband-noise false positives.
         for (int bin = lowBinMin; bin <= lowBinMax; ++bin)
         {
             const float fundamentalHz = (float) bin * (float) currentSampleRate / (float) kFftSize;
             const float fundamentalResidual = currentResidualDb[(size_t) bin];
 
-            if (fundamentalResidual < 1.4f)
+            if (fundamentalResidual < kMinFundamentalResidualDb)
                 continue;
 
             if (fundamentalResidual <= currentResidualDb[(size_t) bin - 1]
                 || fundamentalResidual <= currentResidualDb[(size_t) bin + 1])
                 continue;
 
-            float salience = fundamentalResidual * 0.82f;
+            float salience = fundamentalResidual * kFundamentalSalienceWeight;
             int supportedHarmonics = 0;
 
             for (int harmonic = 2; harmonic <= 3; ++harmonic)
@@ -788,18 +806,19 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
 
                 const float harmonicResidual = strongestResidualNearBin (harmonicBin);
 
-                if (harmonicResidual > 1.2f)
+                if (harmonicResidual > kMinHarmonicResidualDb)
                 {
                     salience += harmonicResidual * harmonicWeights[harmonic];
                     ++supportedHarmonics;
                 }
             }
 
-            if (supportedHarmonics < 1 || salience < 3.9f)
+            if (supportedHarmonics < 1 || salience < kMinBassSalience)
                 continue;
 
             const float originalScore = weightedResidualScore (fundamentalResidual, fundamentalHz);
-            const float bassBonus = juce::jmax (0.0f, salience - fundamentalResidual) * 0.42f;
+            const float bassBonus = juce::jmax (0.0f, salience - fundamentalResidual)
+                                  * kBassHarmonicBonusWeight;
 
             candidates.push_back ({ originalScore + bassBonus,
                                     fundamentalResidual,
@@ -813,7 +832,7 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
         for (int k = 0; k < kNumNoisyPeaks; ++k)
         {
             topFrequenciesHz[(size_t) k] = 0.0f;
-            topMagnitudes[(size_t) k]    = 0.0f;
+            topResidualsDb[(size_t) k]   = 0.0f;
         }
         return;
     }
@@ -825,9 +844,9 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
                });
 
     std::array<float, kNumNoisyPeaks> selectedFreqs {};
-    std::array<float, kNumNoisyPeaks> selectedScores {};
+    std::array<float, kNumNoisyPeaks> selectedResidualsDb {};
     selectedFreqs.fill (0.0f);
-    selectedScores.fill (0.0f);
+    selectedResidualsDb.fill (0.0f);
 
     int selectedCount = 0;
 
@@ -853,7 +872,9 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
             continue;
 
         selectedFreqs[(size_t) selectedCount] = hz;
-        selectedScores[(size_t) selectedCount] = candidate.score;
+        // Ranking may use bass weights and harmonic bonuses, but consumers
+        // receive the unmodified residual dB value.
+        selectedResidualsDb[(size_t) selectedCount] = candidate.residualDb;
         ++selectedCount;
     }
 
@@ -865,12 +886,12 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
             if (k < selectedCount)
             {
                 topFrequenciesHz[(size_t) k] = selectedFreqs[(size_t) k];
-                topMagnitudes[(size_t) k]    = selectedScores[(size_t) k];
+                topResidualsDb[(size_t) k]   = selectedResidualsDb[(size_t) k];
             }
             else
             {
                 topFrequenciesHz[(size_t) k] = 0.0f;
-                topMagnitudes[(size_t) k]    = 0.0f;
+                topResidualsDb[(size_t) k]   = 0.0f;
             }
         }
     }

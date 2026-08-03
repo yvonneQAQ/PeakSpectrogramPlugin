@@ -26,31 +26,13 @@ project(SPEKANA VERSION 0.0.1)
 # add_subdirectory(JUCE)                    # If you've put JUCE in a subdirectory called JUCE
 set(JUCE_SOURCE_DIR "${JUCE_SOURCE_DIR}" CACHE PATH "Path to a local JUCE checkout")
 
-set(_juce_candidates
-    "${JUCE_SOURCE_DIR}"
-    "$ENV{JUCE_SOURCE_DIR}"
-    "$ENV{JUCE_DIR}"
-    "$ENV{JUCE_ROOT}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/JUCE"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../JUCE")
-
-set(_resolved_juce_source_dir "")
-foreach(_juce_candidate IN LISTS _juce_candidates)
-    if(_juce_candidate AND EXISTS "${_juce_candidate}/CMakeLists.txt")
-        set(_resolved_juce_source_dir "${_juce_candidate}")
-        break()
-    endif()
-endforeach()
-
-if(_resolved_juce_source_dir)
-    add_subdirectory("${_resolved_juce_source_dir}" "${CMAKE_BINARY_DIR}/JUCE")
+if(JUCE_SOURCE_DIR)
+    add_subdirectory("${JUCE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/JUCE")
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/JUCE/CMakeLists.txt")
+    add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/JUCE" "${CMAKE_BINARY_DIR}/JUCE")
 else()
-    find_package(JUCE CONFIG QUIET)
-
-    if(NOT JUCE_FOUND)
-        message(FATAL_ERROR
-            "JUCE not found. Set -DJUCE_SOURCE_DIR=/path/to/JUCE, add JUCE to ./JUCE, or install a JUCE package config.")
-    endif()
+    message(FATAL_ERROR
+        "JUCE not found. Set -DJUCE_SOURCE_DIR=/path/to/JUCE or add JUCE to ./JUCE.")
 endif()
 
 # If you are building a VST2 or AAX plugin, CMake needs to be told where to find these SDKs on your
