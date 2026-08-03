@@ -191,6 +191,12 @@ void AudioPluginAudioProcessor::getSpectrumCopy (std::array<float, kFftSize / 2>
     dest = smoothedMagnitudesDb;
 }
 
+void AudioPluginAudioProcessor::getResidualCopy (std::array<float, kFftSize / 2>& dest) const
+{
+    const juce::SpinLock::ScopedLockType lock (fftLock);
+    dest = residualDb;
+}
+
 void AudioPluginAudioProcessor::getTopPeaksCopy (std::array<float, kNumNoisyPeaks>& freqsHz,
                                                  std::array<float, kNumNoisyPeaks>& residualDbOut) const
 {
@@ -250,6 +256,21 @@ void AudioPluginAudioProcessor::setBassBoostMode (bool shouldUseBassBoost)
 bool AudioPluginAudioProcessor::getBassBoostMode() const
 {
     return bassBoostMode.load();
+}
+
+float AudioPluginAudioProcessor::getInputLevelDb() const
+{
+    return inputLevelDb.load();
+}
+
+bool AudioPluginAudioProcessor::getStereoPanAvailable() const
+{
+    return stereoPanAvailable.load();
+}
+
+float AudioPluginAudioProcessor::getStereoPanEnergy() const
+{
+    return stereoPanEnergy.load();
 }
 
 void AudioPluginAudioProcessor::applyPendingMidiOutputChanges (juce::MidiBuffer& midiMessages)
@@ -418,7 +439,7 @@ void AudioPluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPer
     pendingLiveMidiNotes.clear();
     activeLiveMidiNotes.clear();
     pendingLiveMidiUpdate = false;
-    
+
     // Use this method as the place to do any pre-playback
     // initialisation that you need..
     juce::ignoreUnused (sampleRate, samplesPerBlock);
@@ -498,6 +519,12 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     // =====================================================
     if (numInputChannelsForAnalysis > 0)
     {
+        double sumSquares = 0.0;
+        double leftSquares = 0.0;
+        double rightSquares = 0.0;
+        int sampleCount = 0;
+        const bool canMeasureStereoPan = numInputChannelsForAnalysis >= 2;
+
         for (int n = 0; n < numSamples; ++n)
         {
             float mixedSample = 0.0f;
@@ -505,12 +532,46 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             for (int channel = 0; channel < numInputChannelsForAnalysis; ++channel)
                 mixedSample += buffer.getReadPointer (channel)[n];
 
+            if (canMeasureStereoPan)
+            {
+                const auto leftSample = buffer.getReadPointer (0)[n];
+                const auto rightSample = buffer.getReadPointer (1)[n];
+                leftSquares += (double) leftSample * (double) leftSample;
+                rightSquares += (double) rightSample * (double) rightSample;
+            }
+
             mixedSample /= (float) numInputChannelsForAnalysis;
+            sumSquares += (double) mixedSample * (double) mixedSample;
+            ++sampleCount;
             pushSample (mixedSample);
+        }
+
+        const auto rms = sampleCount > 0 ? std::sqrt (sumSquares / (double) sampleCount) : 0.0;
+        const auto level = rms > 1.0e-8 ? 20.0 * std::log10 (rms) : -120.0;
+        inputLevelDb.store ((float) juce::jlimit (-120.0, 12.0, level));
+
+        if (canMeasureStereoPan && sampleCount > 0)
+        {
+            const auto leftEnergy = leftSquares / (double) sampleCount;
+            const auto rightEnergy = rightSquares / (double) sampleCount;
+            const auto totalEnergy = leftEnergy + rightEnergy;
+
+            stereoPanAvailable.store (true);
+            stereoPanEnergy.store (totalEnergy > 1.0e-12
+                                     ? (float) juce::jlimit (-1.0, 1.0, (rightEnergy - leftEnergy) / totalEnergy)
+                                     : 0.0f);
+        }
+        else
+        {
+            stereoPanAvailable.store (false);
+            stereoPanEnergy.store (0.0f);
         }
     }
     else
     {
+        inputLevelDb.store (-120.0f);
+        stereoPanAvailable.store (false);
+        stereoPanEnergy.store (0.0f);
         buffer.clear();
     }
 }
@@ -601,8 +662,11 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
         currentResidualDb[(size_t) bin] = currentSpectrumDb[(size_t) bin]
                                         - currentEnvelopeDb[(size_t) bin];
 
-    envelopeDb = currentEnvelopeDb;
-    residualDb = currentResidualDb;
+    {
+        const juce::SpinLock::ScopedLockType lock (fftLock);
+        envelopeDb = currentEnvelopeDb;
+        residualDb = currentResidualDb;
+    }
 
     // ==========================================================
     // 6. Hybrid ranking:
@@ -678,68 +742,55 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
 
     if (useBassBoost)
     {
-        static constexpr int kBassBoostFftOrder = 13;
-        static constexpr int kBassBoostFftSize = 1 << kBassBoostFftOrder;
-        static juce::dsp::FFT bassBoostFft (kBassBoostFftOrder);
         static constexpr float harmonicWeights[] = { 0.0f, 0.0f, 0.44f, 0.24f };
 
-        std::array<float, 2 * kBassBoostFftSize> paddedFftBuffer {};
-        std::copy (analysisFrame.begin(), analysisFrame.end(), paddedFftBuffer.begin());
-        bassBoostFft.performFrequencyOnlyForwardTransform (paddedFftBuffer.data());
-
-        std::array<float, kBassBoostFftSize / 2> paddedSpectrumDb {};
-        for (int bin = 0; bin < kBassBoostFftSize / 2; ++bin)
+        const auto strongestResidualNearBin = [&currentResidualDb] (int centerBin)
         {
-            const float mag = paddedFftBuffer[(size_t) bin];
-            paddedSpectrumDb[(size_t) bin] = mag <= 1.0e-6f ? -120.0f
-                                                             : 20.0f * std::log10 (mag);
-        }
+            const int safeBin = juce::jlimit (1, numBins - 2, centerBin);
+            float strongestResidual = currentResidualDb[(size_t) safeBin];
 
-        const auto paddedBinForHz = [this] (float hz)
-        {
-            return (int) std::round (hz * (float) kBassBoostFftSize / (float) currentSampleRate);
-        };
-
-        const auto localProminenceDb = [&paddedSpectrumDb] (int centerBin)
-        {
-            const int safeBin = juce::jlimit (6, (int) paddedSpectrumDb.size() - 7, centerBin);
-
-            float localPeak = paddedSpectrumDb[(size_t) safeBin];
             for (int offset = -1; offset <= 1; ++offset)
-                localPeak = juce::jmax (localPeak, paddedSpectrumDb[(size_t) (safeBin + offset)]);
+                strongestResidual = juce::jmax (strongestResidual,
+                                                currentResidualDb[(size_t) (safeBin + offset)]);
 
-            const float leftFloor  = 0.5f * (paddedSpectrumDb[(size_t) (safeBin - 6)]
-                                           + paddedSpectrumDb[(size_t) (safeBin - 3)]);
-            const float rightFloor = 0.5f * (paddedSpectrumDb[(size_t) (safeBin + 3)]
-                                           + paddedSpectrumDb[(size_t) (safeBin + 6)]);
-
-            return localPeak - 0.5f * (leftFloor + rightFloor);
+            return strongestResidual;
         };
 
-        const int lowBinMin = juce::jmax (8, paddedBinForHz (36.0f));
-        const int lowBinMax = juce::jmin ((int) paddedSpectrumDb.size() - 8, paddedBinForHz (170.0f));
+        const int lowBinMin = juce::jlimit (1,
+                                             numBins - 2,
+                                             (int) std::ceil (40.0f * (float) kFftSize
+                                                              / (float) currentSampleRate));
+        const int lowBinMax = juce::jlimit (lowBinMin,
+                                             numBins - 2,
+                                             (int) std::floor (170.0f * (float) kFftSize
+                                                               / (float) currentSampleRate));
 
         for (int bin = lowBinMin; bin <= lowBinMax; ++bin)
         {
-            const float fundamentalHz = (float) bin * (float) currentSampleRate / (float) kBassBoostFftSize;
-            const float baseProminence = localProminenceDb (bin);
-            if (baseProminence < 2.2f)
+            const float fundamentalHz = (float) bin * (float) currentSampleRate / (float) kFftSize;
+            const float fundamentalResidual = currentResidualDb[(size_t) bin];
+
+            if (fundamentalResidual < 1.4f)
                 continue;
 
-            float salience = baseProminence * 0.82f;
+            if (fundamentalResidual <= currentResidualDb[(size_t) bin - 1]
+                || fundamentalResidual <= currentResidualDb[(size_t) bin + 1])
+                continue;
+
+            float salience = fundamentalResidual * 0.82f;
             int supportedHarmonics = 0;
 
             for (int harmonic = 2; harmonic <= 3; ++harmonic)
             {
                 const int harmonicBin = bin * harmonic;
-                if (harmonicBin >= (int) paddedSpectrumDb.size() - 6)
+                if (harmonicBin >= numBins - 1)
                     break;
 
-                const float harmonicProminence = localProminenceDb (harmonicBin);
+                const float harmonicResidual = strongestResidualNearBin (harmonicBin);
 
-                if (harmonicProminence > 1.2f)
+                if (harmonicResidual > 1.2f)
                 {
-                    salience += harmonicProminence * harmonicWeights[harmonic];
+                    salience += harmonicResidual * harmonicWeights[harmonic];
                     ++supportedHarmonics;
                 }
             }
@@ -747,22 +798,12 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
             if (supportedHarmonics < 1 || salience < 3.9f)
                 continue;
 
-            const int originalBin = juce::jlimit (1,
-                                                  numBins - 2,
-                                                  (int) std::round (fundamentalHz
-                                                                    * (float) kFftSize
-                                                                    / (float) currentSampleRate));
-
-            const float originalResidual = currentResidualDb[(size_t) originalBin];
-            if (originalResidual < 1.4f)
-                continue;
-
-            const float originalScore = weightedResidualScore (originalResidual, fundamentalHz);
-            const float bassBonus = juce::jmax (0.0f, salience - baseProminence) * 0.42f;
+            const float originalScore = weightedResidualScore (fundamentalResidual, fundamentalHz);
+            const float bassBonus = juce::jmax (0.0f, salience - fundamentalResidual) * 0.42f;
 
             candidates.push_back ({ originalScore + bassBonus,
-                                    originalResidual,
-                                    originalBin });
+                                    fundamentalResidual,
+                                    bin });
         }
     }
 

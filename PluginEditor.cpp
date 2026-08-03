@@ -11,6 +11,7 @@
 namespace
 {
     constexpr int kMaxFrozenChords = 20;
+    constexpr int kMaxDetailAnalysisFrames = 2400;
 
     const juce::Colour kEditorBackground = juce::Colour::fromRGB (156, 167, 127);
     const juce::Colour kPanelBackground = juce::Colour::fromRGB (41, 56, 49);
@@ -465,17 +466,15 @@ namespace
         sequence.addEvent (juce::MidiMessage::controllerEvent (channel, 100, 127), timeStamp);
     }
 
-    juce::File createMidiFileForSnapshots (const std::vector<FrozenChordSnapshot>& snapshots)
+    constexpr int kMidiTicksPerQuarter = 960;
+
+    void appendFrozenChordEvents (juce::MidiMessageSequence& eventTrack,
+                                  const std::vector<FrozenChordSnapshot>& snapshots)
     {
-        juce::MidiMessageSequence tempoTrack;
-        juce::MidiMessageSequence noteTrack;
-        constexpr int ticksPerQuarter = 960;
         constexpr int velocity = 96;
 
-        tempoTrack.addEvent (juce::MidiMessage::tempoMetaEvent (1000000), 0.0); // 60 BPM -> 1 beat = 1 second
-        tempoTrack.addEvent (juce::MidiMessage::timeSignatureMetaEvent (4, 4), 0.0);
         for (int channel = 1; channel <= AudioPluginAudioProcessor::kNumNoisyPeaks; ++channel)
-            appendPitchBendRangeSetup (noteTrack, channel, 0.0);
+            appendPitchBendRangeSetup (eventTrack, channel, 0.0);
 
         for (size_t chordIndex = 0; chordIndex < snapshots.size(); ++chordIndex)
         {
@@ -503,14 +502,14 @@ namespace
                 int channel = 1;
                 for (const auto& note : quantisedNotes)
                 {
-                    noteTrack.addEvent (juce::MidiMessage::pitchWheel (channel, note.pitchWheelValue),
-                                        startBeat * ticksPerQuarter);
-                    noteTrack.addEvent (juce::MidiMessage::noteOn (channel, note.midiNote, (juce::uint8) velocity),
-                                        startBeat * ticksPerQuarter);
-                    noteTrack.addEvent (juce::MidiMessage::noteOff (channel, note.midiNote),
-                                        endBeat * ticksPerQuarter);
-                    noteTrack.addEvent (juce::MidiMessage::pitchWheel (channel, kPitchBendCentre),
-                                        endBeat * ticksPerQuarter);
+                    eventTrack.addEvent (juce::MidiMessage::pitchWheel (channel, note.pitchWheelValue),
+                                         startBeat * kMidiTicksPerQuarter);
+                    eventTrack.addEvent (juce::MidiMessage::noteOn (channel, note.midiNote, (juce::uint8) velocity),
+                                         startBeat * kMidiTicksPerQuarter);
+                    eventTrack.addEvent (juce::MidiMessage::noteOff (channel, note.midiNote),
+                                         endBeat * kMidiTicksPerQuarter);
+                    eventTrack.addEvent (juce::MidiMessage::pitchWheel (channel, kPitchBendCentre),
+                                         endBeat * kMidiTicksPerQuarter);
 
                     if (++channel > 16)
                         break;
@@ -520,28 +519,125 @@ namespace
             {
                 for (const auto& note : quantisedNotes)
                 {
-                    noteTrack.addEvent (juce::MidiMessage::noteOn (1, note.midiNote, (juce::uint8) velocity),
-                                        startBeat * ticksPerQuarter);
-                    noteTrack.addEvent (juce::MidiMessage::noteOff (1, note.midiNote),
-                                        endBeat * ticksPerQuarter);
+                    eventTrack.addEvent (juce::MidiMessage::noteOn (1, note.midiNote, (juce::uint8) velocity),
+                                         startBeat * kMidiTicksPerQuarter);
+                    eventTrack.addEvent (juce::MidiMessage::noteOff (1, note.midiNote),
+                                         endBeat * kMidiTicksPerQuarter);
                 }
             }
         }
 
-        noteTrack.updateMatchedPairs();
+        eventTrack.updateMatchedPairs();
+    }
+
+    int normalisedDescriptorToCc (float value)
+    {
+        return juce::jlimit (0, 127, (int) std::round (juce::jlimit (0.0f, 1.0f, value) * 127.0f));
+    }
+
+    int centroidToCc (float frequencyHz)
+    {
+        constexpr float minFrequencyHz = 20.0f;
+        constexpr float maxFrequencyHz = 24000.0f;
+        const float clampedHz = juce::jlimit (minFrequencyHz, maxFrequencyHz, frequencyHz);
+        const float normalised = std::log (clampedHz / minFrequencyHz)
+                               / std::log (maxFrequencyHz / minFrequencyHz);
+        return normalisedDescriptorToCc (normalised);
+    }
+
+    void appendDescriptorEvents (juce::MidiMessageSequence& eventTrack,
+                                 const std::vector<DetailAnalysisFrame>& frames)
+    {
+        constexpr int midiChannel = 1;
+        constexpr int centroidCc = 20;
+        constexpr int flatnessCc = 21;
+        constexpr int roughnessCc = 22;
+        constexpr int stereoPanCc = 23;
+
+        int previousCentroid = -1;
+        int previousFlatness = -1;
+        int previousRoughness = -1;
+        int previousPan = -1;
+
+        for (const auto& frame : frames)
+        {
+            const double tick = juce::jmax (0.0, frame.timeSeconds) * kMidiTicksPerQuarter;
+            const int centroid = centroidToCc (frame.centroidHz);
+            const int flatness = normalisedDescriptorToCc (frame.spectralFlatness);
+            const int roughness = normalisedDescriptorToCc (frame.roughness);
+
+            if (centroid != previousCentroid)
+            {
+                eventTrack.addEvent (juce::MidiMessage::controllerEvent (midiChannel, centroidCc, centroid), tick);
+                previousCentroid = centroid;
+            }
+
+            if (flatness != previousFlatness)
+            {
+                eventTrack.addEvent (juce::MidiMessage::controllerEvent (midiChannel, flatnessCc, flatness), tick);
+                previousFlatness = flatness;
+            }
+
+            if (roughness != previousRoughness)
+            {
+                eventTrack.addEvent (juce::MidiMessage::controllerEvent (midiChannel, roughnessCc, roughness), tick);
+                previousRoughness = roughness;
+            }
+
+            if (frame.stereoPanAvailable)
+            {
+                const int pan = normalisedDescriptorToCc (0.5f * (frame.stereoPanEnergy + 1.0f));
+                if (pan != previousPan)
+                {
+                    eventTrack.addEvent (juce::MidiMessage::controllerEvent (midiChannel, stereoPanCc, pan), tick);
+                    previousPan = pan;
+                }
+            }
+        }
+    }
+
+    juce::File writeMidiFile (const juce::String& baseName,
+                              const juce::MidiMessageSequence& eventTrack)
+    {
+        juce::MidiMessageSequence combinedTrack (eventTrack);
+        combinedTrack.addEvent (juce::MidiMessage::tempoMetaEvent (1000000), 0.0); // 60 BPM: one beat = one second
+        combinedTrack.addEvent (juce::MidiMessage::timeSignatureMetaEvent (4, 4), 0.0);
 
         juce::MidiFile midiFile;
-        midiFile.setTicksPerQuarterNote (ticksPerQuarter);
-        midiFile.addTrack (tempoTrack);
-        midiFile.addTrack (noteTrack);
+        midiFile.setTicksPerQuarterNote (kMidiTicksPerQuarter);
+        midiFile.addTrack (combinedTrack);
 
         auto midiFilePath = juce::File::getSpecialLocation (juce::File::tempDirectory)
-                                .getNonexistentChildFile ("FrozenChords", ".mid", false);
+                                .getNonexistentChildFile (baseName, ".mid", false);
 
         if (auto stream = midiFilePath.createOutputStream())
-            midiFile.writeTo (*stream, 0);
+            midiFile.writeTo (*stream, 0); // Type 0: one track containing tempo, notes, pitch bend, and CC.
 
         return midiFilePath;
+    }
+
+    juce::File createMidiFileForSnapshots (const std::vector<FrozenChordSnapshot>& snapshots)
+    {
+        juce::MidiMessageSequence eventTrack;
+        appendFrozenChordEvents (eventTrack, snapshots);
+        return writeMidiFile ("FrozenChords", eventTrack);
+    }
+
+    juce::File createDescriptorMidiFile (const std::vector<DetailAnalysisFrame>& frames)
+    {
+        juce::MidiMessageSequence eventTrack;
+        appendDescriptorEvents (eventTrack, frames);
+        return writeMidiFile ("SPEKANA_Descriptors", eventTrack);
+    }
+
+    juce::File createCombinedMidiFile (const std::vector<FrozenChordSnapshot>& snapshots,
+                                       const std::vector<DetailAnalysisFrame>& frames)
+    {
+        juce::MidiMessageSequence eventTrack;
+        appendFrozenChordEvents (eventTrack, snapshots);
+        appendDescriptorEvents (eventTrack, frames);
+        eventTrack.updateMatchedPairs();
+        return writeMidiFile ("SPEKANA_Combined", eventTrack);
     }
 }
 
@@ -668,6 +764,7 @@ private:
         const float startX = left + 8.0f;
         const float availableWidth = right - startX - 8.0f;
         const float step = availableWidth / (float) juce::jmax (1, kMaxFrozenChords - 1);
+        const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
 
         for (size_t i = 0; i < snapshots.size(); ++i)
         {
@@ -676,7 +773,28 @@ private:
             if (notes.empty())
                 continue;
 
-            drawChord (g, content, notes, x);
+            float animationProgress = 1.0f;
+            if (snapshots[i].visualCreatedWallTimeSeconds > 0.0)
+            {
+                const auto elapsedSeconds = nowSeconds - snapshots[i].visualCreatedWallTimeSeconds;
+                animationProgress = juce::jlimit (0.0f, 1.0f, (float) (elapsedSeconds / 0.28));
+            }
+
+            const float easedProgress = 1.0f - std::pow (1.0f - animationProgress, 3.0f);
+            const float chordAlpha = 0.24f + 0.76f * easedProgress;
+
+            if (animationProgress < 1.0f)
+            {
+                const float glowAlpha = (1.0f - animationProgress) * 0.18f;
+                auto glowBounds = juce::Rectangle<float> (x - 15.0f,
+                                                          (float) content.getY() + 8.0f,
+                                                          32.0f,
+                                                          (float) content.getHeight() - 16.0f);
+                g.setColour (kButtonTerracottaStrong.withAlpha (glowAlpha));
+                g.fillRoundedRectangle (glowBounds, 13.0f);
+            }
+
+            drawChord (g, content, notes, x, chordAlpha);
 
             if (i + 1 < (size_t) kMaxFrozenChords)
             {
@@ -700,12 +818,14 @@ private:
     void drawLedgerLines (juce::Graphics& g,
                           juce::Rectangle<int> area,
                           float noteX,
-                          int diatonicNumber) const
+                          int diatonicNumber,
+                          float alpha) const
     {
         constexpr int bassBottomLine = 18;  // G2
         constexpr int middleC = 28;         // C4
         constexpr int trebleTopLine = 38;   // F5
         const float noteWidth = 10.0f;
+        g.setColour (kTextPrimary.withAlpha (alpha));
 
         if (diatonicNumber == middleC)
         {
@@ -734,10 +854,12 @@ private:
     void drawChord (juce::Graphics& g,
                     juce::Rectangle<int> area,
                     const std::vector<PitchNotation>& notes,
-                    float centerX) const
+                    float centerX,
+                    float alpha = 1.0f) const
     {
         const float noteHeadWidth = 5.8f;
         const float noteHeadHeight = 3.9f;
+        alpha = juce::jlimit (0.0f, 1.0f, alpha);
 
         int previousDiatonic = std::numeric_limits<int>::min();
         int clusterIndex = 0;
@@ -753,11 +875,12 @@ private:
             const float noteX = centerX + xOffset;
             const float noteY = yForDiatonicNumber (area, note.diatonicNumber);
 
-            g.setColour (kTextPrimary);
-            drawLedgerLines (g, area, noteX, note.diatonicNumber);
+            g.setColour (kTextPrimary.withAlpha (alpha));
+            drawLedgerLines (g, area, noteX, note.diatonicNumber, alpha);
 
             if (note.accidentalForStaff == "q#" || note.accidentalForStaff == "qb")
             {
+                g.setColour (kTextPrimary.withAlpha (alpha));
                 drawQuarterToneArrowMark (g,
                                           juce::Rectangle<float> (noteX - 10.0f, noteY - 5.5f, 6.0f, 11.0f),
                                           note.accidentalForStaff == "q#");
@@ -767,6 +890,7 @@ private:
                 const auto accidentalGlyph = accidentalGlyphForStaff (note.accidentalForStaff);
                 if (accidentalGlyph.isNotEmpty())
                 {
+                    g.setColour (kTextPrimary.withAlpha (alpha));
                     g.setFont (makeMusicFont (8.0f));
                     g.drawText (accidentalGlyph,
                                 juce::Rectangle<float> (noteX - 10.0f, noteY - 5.0f, 8.0f, 10.0f).toNearestInt(),
@@ -779,6 +903,7 @@ private:
             noteHead.applyTransform (juce::AffineTransform::rotation (juce::degreesToRadians (-22.0f),
                                                                       noteX + noteHeadWidth * 0.5f,
                                                                       noteY));
+            g.setColour (kTextPrimary.withAlpha (alpha));
             g.fillPath (noteHead);
 
             drawnNotes.push_back ({ noteX, noteY, note.diatonicNumber });
@@ -796,15 +921,68 @@ private:
         {
             const auto& anchor = drawnNotes.back();
             const float stemX = anchor.x + 0.8f;
+            g.setColour (kTextPrimary.withAlpha (alpha));
             g.drawLine (stemX, anchor.y, stemX, anchor.y + 14.4f, 1.0f);
         }
         else
         {
             const auto& anchor = drawnNotes.front();
             const float stemX = anchor.x + noteHeadWidth - 0.8f;
+            g.setColour (kTextPrimary.withAlpha (alpha));
             g.drawLine (stemX, anchor.y, stemX, anchor.y - 14.4f, 1.0f);
         }
     }
+};
+
+class DescriptorMidiDragComponent : public juce::Component
+{
+public:
+    DescriptorMidiDragComponent (const std::vector<DetailAnalysisFrame>& analysisFrames,
+                                 const std::vector<FrozenChordSnapshot>& chordSnapshots)
+        : frames (analysisFrames),
+          snapshots (chordSnapshots)
+    {
+        setMouseCursor (juce::MouseCursor::DraggingHandCursor);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto bounds = getLocalBounds().toFloat();
+        const bool enabled = ! frames.empty();
+        g.setColour (enabled ? kButtonTerracotta : kButtonTerracotta.withMultipliedAlpha (0.42f));
+        g.fillRoundedRectangle (bounds, 9.0f);
+        g.setColour (kButtonText);
+        g.setFont (makeUIFont (8.6f, true));
+        g.drawText (snapshots.empty() ? "Drag Descriptor MIDI" : "Drag Combined MIDI",
+                    getLocalBounds(),
+                    juce::Justification::centred);
+    }
+
+    void mouseDown (const juce::MouseEvent&) override
+    {
+        dragTriggered = false;
+    }
+
+    void mouseDrag (const juce::MouseEvent& event) override
+    {
+        if (dragTriggered || frames.empty() || event.getDistanceFromDragStart() < 6)
+            return;
+
+        const auto midiFile = snapshots.empty()
+                                ? createDescriptorMidiFile (frames)
+                                : createCombinedMidiFile (snapshots, frames);
+        if (! midiFile.existsAsFile())
+            return;
+
+        dragTriggered = true;
+        juce::DragAndDropContainer::performExternalDragDropOfFiles (
+            juce::StringArray { midiFile.getFullPathName() }, false, this);
+    }
+
+private:
+    const std::vector<DetailAnalysisFrame>& frames;
+    const std::vector<FrozenChordSnapshot>& snapshots;
+    bool dragTriggered = false;
 };
 
 namespace
@@ -833,7 +1011,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     lookAndFeel = std::make_unique<MinimalPluginLookAndFeel>();
     setLookAndFeel (lookAndFeel.get());
 
-    setSize (860, 470);
+    setSize (860, 520);
     spectrogramImage = juce::Image (juce::Image::RGB, 420, 220, true);
     clearSpectrogramImage();
 
@@ -845,9 +1023,23 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     addAndMakeVisible (bassBoostButton);
     addAndMakeVisible (quarterToneButton);
     addAndMakeVisible (exportMidiButton);
+    addAndMakeVisible (manualModeButton);
+    addAndMakeVisible (autoModeButton);
+    addAndMakeVisible (autoStartButton);
+    addAndMakeVisible (autoStopButton);
+    addAndMakeVisible (autoClearButton);
+    addAndMakeVisible (detailAnalysisButton);
+    addAndMakeVisible (topPeakCountSlider);
+    addAndMakeVisible (autoSensitivitySlider);
+    addAndMakeVisible (autoMinGapSlider);
 
     staffComponent = std::make_unique<FrozenChordStaffComponent>();
     addAndMakeVisible (*staffComponent);
+
+    descriptorMidiDragComponent = std::make_unique<DescriptorMidiDragComponent> (detailAnalysisHistory,
+                                                                                  frozenChords);
+    addAndMakeVisible (*descriptorMidiDragComponent);
+    descriptorMidiDragComponent->setVisible (false);
 
     styleTextButton (freezeButton, true);
     styleTextButton (unfreezeButton);
@@ -855,6 +1047,110 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     styleTextButton (bassBoostButton);
     styleTextButton (quarterToneButton);
     styleTextButton (exportMidiButton);
+    styleTextButton (manualModeButton);
+    styleTextButton (autoModeButton);
+    styleTextButton (autoStartButton, true);
+    styleTextButton (autoStopButton);
+    styleTextButton (autoClearButton);
+    styleTextButton (detailAnalysisButton);
+
+    manualModeButton.setClickingTogglesState (true);
+    autoModeButton.setClickingTogglesState (true);
+    manualModeButton.onClick = [this]() { setAutoPageActive (false); };
+    autoModeButton.onClick = [this]() { setAutoPageActive (true); };
+
+    autoStartButton.onClick = [this]()
+    {
+        isDetailPageActive = false;
+        isAutoRunning = true;
+        autoStartWallTimeSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
+        detailAnalysisHistory.clear();
+        hasCompletedAutoAnalysis = false;
+        resetAutoDetectorState();
+        refreshAutoButtonStates();
+        refreshDetailAnalysisButtonState();
+        refreshExportButtonState();
+        showTransientStatusMessage ("Auto listening for onsets.");
+        repaint();
+    };
+
+    autoStopButton.onClick = [this]()
+    {
+        const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
+        if (! frozenChords.empty() && frozenChords.back().label.startsWith ("Auto "))
+            frozenChords.back().endTimeSeconds = juce::jmax (frozenChords.back().startTimeSeconds + 0.05,
+                                                             nowSeconds - autoStartWallTimeSeconds);
+
+        isAutoRunning = false;
+        hasCompletedAutoAnalysis = ! detailAnalysisHistory.empty();
+        refreshStaffComponent();
+        refreshAutoButtonStates();
+        refreshDetailAnalysisButtonState();
+        showTransientStatusMessage ("Auto stopped.");
+        repaint();
+    };
+
+    autoClearButton.onClick = [this]()
+    {
+        resetFrozenState();
+        resetAutoDetectorState();
+        showTransientStatusMessage ("Auto captures cleared.");
+    };
+
+    detailAnalysisButton.setClickingTogglesState (true);
+    detailAnalysisButton.onClick = [this]()
+    {
+        if (! hasCompletedAutoAnalysis || detailAnalysisHistory.empty() || isAutoRunning)
+        {
+            detailAnalysisButton.setToggleState (false, juce::dontSendNotification);
+            return;
+        }
+
+        isDetailPageActive = ! isDetailPageActive;
+        detailAnalysisButton.setToggleState (isDetailPageActive, juce::dontSendNotification);
+
+        if (staffComponent != nullptr)
+            staffComponent->setVisible (! isDetailPageActive);
+
+        if (descriptorMidiDragComponent != nullptr)
+            descriptorMidiDragComponent->setVisible (isDetailPageActive);
+
+        repaint();
+    };
+
+    topPeakCountSlider.setRange (1.0, (double) kNumNoisyPeaks, 1.0);
+    topPeakCountSlider.setValue ((double) kNumNoisyPeaks, juce::dontSendNotification);
+    topPeakCountSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+    topPeakCountSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 30, 16);
+    topPeakCountSlider.setColour (juce::Slider::trackColourId, kButtonTerracotta);
+    topPeakCountSlider.setColour (juce::Slider::thumbColourId, kButtonTerracottaStrong);
+    topPeakCountSlider.setColour (juce::Slider::backgroundColourId, kPanelTint.withMultipliedAlpha (0.35f));
+    topPeakCountSlider.setColour (juce::Slider::textBoxTextColourId, kTextPrimary);
+    topPeakCountSlider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+    topPeakCountSlider.onValueChange = [this]()
+    {
+        repaint();
+    };
+
+    autoSensitivitySlider.setRange (1.0, 10.0, 0.5);
+    autoSensitivitySlider.setValue (7.0, juce::dontSendNotification);
+    autoSensitivitySlider.setSliderStyle (juce::Slider::LinearHorizontal);
+    autoSensitivitySlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 34, 16);
+    autoSensitivitySlider.setColour (juce::Slider::trackColourId, kButtonTerracotta);
+    autoSensitivitySlider.setColour (juce::Slider::thumbColourId, kButtonTerracottaStrong);
+    autoSensitivitySlider.setColour (juce::Slider::backgroundColourId, kPanelTint.withMultipliedAlpha (0.35f));
+    autoSensitivitySlider.setColour (juce::Slider::textBoxTextColourId, kTextPrimary);
+    autoSensitivitySlider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+
+    autoMinGapSlider.setRange (80.0, 600.0, 10.0);
+    autoMinGapSlider.setValue (180.0, juce::dontSendNotification);
+    autoMinGapSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+    autoMinGapSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 34, 16);
+    autoMinGapSlider.setColour (juce::Slider::trackColourId, kButtonTerracotta);
+    autoMinGapSlider.setColour (juce::Slider::thumbColourId, kButtonTerracottaStrong);
+    autoMinGapSlider.setColour (juce::Slider::backgroundColourId, kPanelTint.withMultipliedAlpha (0.35f));
+    autoMinGapSlider.setColour (juce::Slider::textBoxTextColourId, kTextPrimary);
+    autoMinGapSlider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
 
     bassBoostButton.setClickingTogglesState (true);
     bassBoostButton.setToggleState (processorRef.getBassBoostMode(), juce::dontSendNotification);
@@ -917,14 +1213,22 @@ unfreezeButton.onClick = [this]()
 
     exportMidiButton.onClick = [this]()
     {
-        auto midiFile = createMidiFileForSnapshots (frozenChords);
+        const bool includeDescriptors = hasCompletedAutoAnalysis
+                                     && ! detailAnalysisHistory.empty();
+        auto midiFile = includeDescriptors
+                          ? createCombinedMidiFile (frozenChords, detailAnalysisHistory)
+                          : createMidiFileForSnapshots (frozenChords);
         if (! midiFile.existsAsFile())
             return;
 
         exportMidiChooser = std::make_unique<juce::FileChooser> (
-            "Export Frozen Chords MIDI",
+            includeDescriptors ? "Export Combined Notes and Descriptors MIDI"
+                               : "Export Frozen Chords MIDI",
             juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
-                .getNonexistentChildFile ("FrozenChords", ".mid", false),
+                .getNonexistentChildFile (includeDescriptors ? "SPEKANA_Combined"
+                                                             : "FrozenChords",
+                                          ".mid",
+                                          false),
             "*.mid");
 
         exportMidiChooser->launchAsync (juce::FileBrowserComponent::saveMode
@@ -947,6 +1251,9 @@ unfreezeButton.onClick = [this]()
     };
 
     refreshExportButtonState();
+    refreshModeButtonStates();
+    refreshAutoButtonStates();
+    refreshDetailAnalysisButtonState();
     bassBoostButton.toFront (false);
     resized();
 }
@@ -960,6 +1267,359 @@ AudioPluginAudioProcessorEditor::~AudioPluginAudioProcessorEditor()
 bool AudioPluginAudioProcessorEditor::useQuarterToneMode() const
 {
     return quarterToneButton.getToggleState();
+}
+
+int AudioPluginAudioProcessorEditor::getActivePeakCount() const
+{
+    return juce::jlimit (1, kNumNoisyPeaks, (int) std::round (topPeakCountSlider.getValue()));
+}
+
+juce::String AudioPluginAudioProcessorEditor::formatTimeLabel (double seconds) const
+{
+    if (seconds < 0.0)
+        seconds = 0.0;
+
+    const int totalMilliseconds = (int) std::round (seconds * 1000.0);
+    const int minutes = totalMilliseconds / 60000;
+    const int secondsPart = (totalMilliseconds / 1000) % 60;
+    const int milliseconds = totalMilliseconds % 1000;
+
+    return juce::String (minutes).paddedLeft ('0', 2)
+         + ":" + juce::String (secondsPart).paddedLeft ('0', 2)
+         + "." + juce::String (milliseconds).paddedLeft ('0', 3);
+}
+
+juce::String AudioPluginAudioProcessorEditor::getCurrentHostTimeLabel() const
+{
+    if (auto* playHead = processorRef.getPlayHead())
+    {
+        if (const auto position = playHead->getPosition())
+        {
+            if (const auto timeInSeconds = position->getTimeInSeconds())
+                return formatTimeLabel (*timeInSeconds);
+        }
+    }
+
+    return "local " + formatTimeLabel (activeFreezeSessionOffsetSeconds);
+}
+
+void AudioPluginAudioProcessorEditor::setAutoPageActive (bool shouldUseAutoPage)
+{
+    if (! shouldUseAutoPage && isAutoRunning)
+    {
+        const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
+        if (! frozenChords.empty() && frozenChords.back().label.startsWith ("Auto "))
+            frozenChords.back().endTimeSeconds = juce::jmax (frozenChords.back().startTimeSeconds + 0.05,
+                                                             nowSeconds - autoStartWallTimeSeconds);
+
+        isAutoRunning = false;
+        hasCompletedAutoAnalysis = ! detailAnalysisHistory.empty();
+        processorRef.clearLiveFrozenMidiChord();
+        refreshAutoButtonStates();
+        refreshDetailAnalysisButtonState();
+    }
+
+    isAutoPageActive = shouldUseAutoPage;
+    isDetailPageActive = false;
+    refreshModeButtonStates();
+    refreshDetailAnalysisButtonState();
+    refreshStaffComponent();
+    resized();
+    repaint();
+}
+
+void AudioPluginAudioProcessorEditor::refreshModeButtonStates()
+{
+    manualModeButton.setToggleState (! isAutoPageActive, juce::dontSendNotification);
+    autoModeButton.setToggleState (isAutoPageActive, juce::dontSendNotification);
+
+    freezeButton.setVisible (! isAutoPageActive);
+    unfreezeButton.setVisible (! isAutoPageActive);
+    resetButton.setVisible (! isAutoPageActive);
+    quarterToneButton.setVisible (true);
+    exportMidiButton.setVisible (true);
+
+    autoStartButton.setVisible (isAutoPageActive);
+    autoStopButton.setVisible (isAutoPageActive);
+    autoClearButton.setVisible (isAutoPageActive);
+    autoSensitivitySlider.setVisible (isAutoPageActive);
+    autoMinGapSlider.setVisible (isAutoPageActive);
+}
+
+void AudioPluginAudioProcessorEditor::refreshAutoButtonStates()
+{
+    autoStartButton.setEnabled (! isAutoRunning);
+    autoStopButton.setEnabled (isAutoRunning);
+    autoClearButton.setEnabled (! frozenChords.empty() || autoCaptureCount > 0);
+}
+
+void AudioPluginAudioProcessorEditor::resetAutoDetectorState()
+{
+    previousAutoResidual.fill (0.0f);
+    hasPreviousAutoResidual = false;
+    hasPreviousAutoInputLevel = false;
+    autoFluxMean = 0.0f;
+    autoFluxDeviation = 0.18f;
+    autoOnsetStrength = 0.0f;
+    previousAutoInputLevelDb = -120.0f;
+    lastAutoOnsetWallTimeSeconds = -10.0;
+}
+
+DetailAnalysisFrame AudioPluginAudioProcessorEditor::calculateDetailAnalysisFrame (double nowSeconds) const
+{
+    DetailAnalysisFrame frame;
+    frame.timeSeconds = juce::jmax (0.0, nowSeconds - autoStartWallTimeSeconds);
+    frame.stereoPanAvailable = processorRef.getStereoPanAvailable();
+    frame.stereoPanEnergy = processorRef.getStereoPanEnergy();
+
+    const float sampleRate = (float) processorRef.getSampleRate();
+    const int numBins = (int) latestSpectrum.size();
+    if (sampleRate <= 0.0f || numBins <= 2)
+        return frame;
+
+    // Descriptor analysis uses the complete available positive-frequency
+    // spectrum, independently of the narrower pitch-detection range.
+    // Bin 0 is excluded so that DC offset cannot pull the centroid downward.
+    const int minBin = 1;
+    const int maxBin = numBins - 1;
+
+    double logMagnitudeSum = 0.0;
+    double magnitudeSum = 0.0;
+    double weightedFrequencySum = 0.0;
+    int magnitudeCount = 0;
+
+    for (int bin = minBin; bin <= maxBin; ++bin)
+    {
+        const float db = juce::jlimit (-120.0f, 24.0f, latestSpectrum[(size_t) bin]);
+        const double magnitude = juce::jmax (1.0e-12, std::pow (10.0, (double) db / 20.0));
+        const double hz = (double) bin * sampleRate / (double) kFftSize;
+
+        logMagnitudeSum += std::log (magnitude);
+        magnitudeSum += magnitude;
+        weightedFrequencySum += hz * magnitude;
+        ++magnitudeCount;
+    }
+
+    if (magnitudeCount > 0 && magnitudeSum > 1.0e-12)
+    {
+        const double geometricMean = std::exp (logMagnitudeSum / (double) magnitudeCount);
+        const double arithmeticMean = magnitudeSum / (double) magnitudeCount;
+        frame.spectralFlatness = (float) juce::jlimit (0.0, 1.0, geometricMean / arithmeticMean);
+        frame.centroidHz = (float) juce::jlimit (0.0, (double) sampleRate * 0.5,
+                                                weightedFrequencySum / magnitudeSum);
+    }
+
+    struct Partial
+    {
+        float hz = 0.0f;
+        float amplitude = 0.0f;
+    };
+
+    std::array<Partial, kNumNoisyPeaks> partials {};
+    int partialCount = 0;
+
+    for (int i = 0; i < getActivePeakCount(); ++i)
+    {
+        const auto hz = topFreqsForDrawing[(size_t) i];
+        if (hz <= 20.0f)
+            continue;
+
+        const auto residualDb = juce::jlimit (0.0f, 36.0f, topMagsForDrawing[(size_t) i]);
+        partials[(size_t) partialCount++] = { hz, residualDb / 36.0f };
+
+        if (partialCount >= kNumNoisyPeaks)
+            break;
+    }
+
+    double roughnessSum = 0.0;
+    for (int i = 0; i < partialCount; ++i)
+    {
+        for (int j = i + 1; j < partialCount; ++j)
+        {
+            const float fMin = juce::jmin (partials[(size_t) i].hz, partials[(size_t) j].hz);
+            const float freqDistance = std::abs (partials[(size_t) j].hz - partials[(size_t) i].hz);
+            const float s = 0.24f / (0.021f * fMin + 19.0f);
+            const float x = s * freqDistance;
+            const float pairRoughness = partials[(size_t) i].amplitude
+                                      * partials[(size_t) j].amplitude
+                                      * (std::exp (-3.5f * x) - std::exp (-5.75f * x));
+
+            roughnessSum += juce::jmax (0.0f, pairRoughness);
+        }
+    }
+
+    frame.roughness = (float) juce::jlimit (0.0, 1.0, roughnessSum * 2.2);
+    return frame;
+}
+
+void AudioPluginAudioProcessorEditor::recordDetailAnalysisFrame (double nowSeconds)
+{
+    if (! isAutoRunning)
+        return;
+
+    detailAnalysisHistory.push_back (calculateDetailAnalysisFrame (nowSeconds));
+
+    if ((int) detailAnalysisHistory.size() > kMaxDetailAnalysisFrames)
+        detailAnalysisHistory.erase (detailAnalysisHistory.begin());
+}
+
+void AudioPluginAudioProcessorEditor::refreshDetailAnalysisButtonState()
+{
+    const bool canOpenDetail = hasCompletedAutoAnalysis
+                            && ! detailAnalysisHistory.empty()
+                            && ! isAutoRunning;
+
+    detailAnalysisButton.setEnabled (canOpenDetail);
+
+    if (! canOpenDetail)
+        isDetailPageActive = false;
+
+    detailAnalysisButton.setToggleState (isDetailPageActive && canOpenDetail, juce::dontSendNotification);
+
+    if (staffComponent != nullptr)
+        staffComponent->setVisible (! isDetailPageActive);
+
+    if (descriptorMidiDragComponent != nullptr)
+        descriptorMidiDragComponent->setVisible (isDetailPageActive && canOpenDetail);
+}
+
+void AudioPluginAudioProcessorEditor::captureAutoChord (double nowSeconds)
+{
+    if ((int) frozenChords.size() >= kMaxFrozenChords)
+    {
+        isAutoRunning = false;
+        processorRef.clearLiveFrozenMidiChord();
+        showTransientStatusMessage ("20 chords max reached. Press Clear to start a new score.");
+        refreshAutoButtonStates();
+        refreshStaffComponent();
+        return;
+    }
+
+    const double startTimeSeconds = juce::jmax (0.0, nowSeconds - autoStartWallTimeSeconds);
+
+    if (! frozenChords.empty() && frozenChords.back().label.startsWith ("Auto "))
+        frozenChords.back().endTimeSeconds = juce::jmax (frozenChords.back().startTimeSeconds + 0.05,
+                                                         startTimeSeconds);
+
+    FrozenChordSnapshot snapshot;
+    if (firstFreezeTimeLabel.isEmpty())
+        firstFreezeTimeLabel = getCurrentHostTimeLabel();
+
+    snapshot.freqsHz.fill (0.0f);
+    const int activePeakCount = getActivePeakCount();
+    for (int i = 0; i < activePeakCount; ++i)
+        snapshot.freqsHz[(size_t) i] = topFreqsForDrawing[(size_t) i];
+
+    snapshot.useQuarterToneMode = useQuarterToneMode();
+    snapshot.startTimeSeconds = startTimeSeconds;
+    snapshot.endTimeSeconds = startTimeSeconds + 0.25;
+    snapshot.visualCreatedWallTimeSeconds = nowSeconds;
+
+    ++autoCaptureCount;
+    ++freezeCaptureCount;
+    snapshot.label = "Auto " + juce::String (autoCaptureCount);
+
+    frozenChords.push_back (snapshot);
+    processorRef.setLiveFrozenMidiChord (snapshot.freqsHz, snapshot.useQuarterToneMode);
+    pendingFreezeMarker = true;
+
+    refreshStaffComponent();
+    refreshAutoButtonStates();
+}
+
+void AudioPluginAudioProcessorEditor::processAutoOnsetDetection (double nowSeconds)
+{
+    if (! isAutoPageActive || ! isAutoRunning)
+        return;
+
+    if ((int) frozenChords.size() >= kMaxFrozenChords)
+    {
+        isAutoRunning = false;
+        processorRef.clearLiveFrozenMidiChord();
+        refreshAutoButtonStates();
+        showTransientStatusMessage ("20 chords max reached. Auto stopped.");
+        repaint();
+        return;
+    }
+
+    constexpr float kLevelTriggerFloorDb = -72.0f;
+    constexpr float kSignificantLevelRiseDb = 6.0f;
+
+    const float inputLevelDb = processorRef.getInputLevelDb();
+    bool significantLevelRise = false;
+
+    if (hasPreviousAutoInputLevel)
+    {
+        significantLevelRise = inputLevelDb > kLevelTriggerFloorDb
+                            && inputLevelDb - previousAutoInputLevelDb > kSignificantLevelRiseDb;
+    }
+
+    previousAutoInputLevelDb = inputLevelDb;
+    hasPreviousAutoInputLevel = true;
+
+    bool spectralOnsetDetected = false;
+    float threshold = 0.0f;
+
+    // Keep the existing residual-flux detector unchanged as route A. Route B
+    // (the level-rise trigger above) can capture independently of this block.
+    if (inputLevelDb > -96.0f && hasPreviousAutoResidual)
+    {
+        const float sampleRate = (float) processorRef.getSampleRate();
+
+        if (sampleRate > 0.0f)
+        {
+            const int numBins = (int) latestResidual.size();
+            const int minBin = juce::jlimit (1, numBins - 2, (int) std::floor (40.0f * (float) kFftSize / sampleRate));
+            const int maxBin = juce::jlimit (minBin + 1, numBins - 2, (int) std::ceil (4000.0f * (float) kFftSize / sampleRate));
+
+            float flux = 0.0f;
+            float strongestRise = 0.0f;
+            int contributingBins = 0;
+
+            for (int bin = minBin; bin <= maxBin; ++bin)
+            {
+                const float rise = latestResidual[(size_t) bin] - previousAutoResidual[(size_t) bin];
+                strongestRise = juce::jmax (strongestRise, rise);
+
+                if (rise > 0.18f)
+                {
+                    flux += rise;
+                    ++contributingBins;
+                }
+            }
+
+            if (contributingBins > 0)
+                flux /= (float) contributingBins;
+
+            const float instantOnsetStrength = 0.68f * flux + 0.32f * strongestRise;
+            autoOnsetStrength = 0.58f * autoOnsetStrength + 0.42f * instantOnsetStrength;
+
+            const float previousMean = autoFluxMean;
+            autoFluxMean = 0.985f * autoFluxMean + 0.015f * autoOnsetStrength;
+            autoFluxDeviation = 0.985f * autoFluxDeviation
+                              + 0.015f * std::abs (autoOnsetStrength - previousMean);
+
+            const float sensitivity = (float) autoSensitivitySlider.getValue();
+            const float thresholdScale = juce::jmap (sensitivity, 1.0f, 10.0f, 3.2f, 0.65f);
+            threshold = autoFluxMean + thresholdScale * juce::jmax (0.18f, autoFluxDeviation);
+            spectralOnsetDetected = autoOnsetStrength > threshold && autoOnsetStrength > 0.28f;
+        }
+    }
+
+    previousAutoResidual = latestResidual;
+    hasPreviousAutoResidual = true;
+
+    const double minGapSeconds = autoMinGapSlider.getValue() * 0.001;
+    const bool outsideRefractory = (nowSeconds - lastAutoOnsetWallTimeSeconds) >= minGapSeconds;
+
+    if (outsideRefractory && (spectralOnsetDetected || significantLevelRise))
+    {
+        captureAutoChord (nowSeconds);
+        lastAutoOnsetWallTimeSeconds = nowSeconds;
+        autoOnsetStrength = 0.0f;
+        if (spectralOnsetDetected)
+            autoFluxMean = threshold;
+    }
 }
 
 void AudioPluginAudioProcessorEditor::refreshBassBoostButtonText()
@@ -983,11 +1643,19 @@ void AudioPluginAudioProcessorEditor::captureFrozenChord()
     }
 
     FrozenChordSnapshot snapshot;
-    snapshot.freqsHz = topFreqsForDrawing;
+    if (firstFreezeTimeLabel.isEmpty())
+        firstFreezeTimeLabel = getCurrentHostTimeLabel();
+
+    snapshot.freqsHz.fill (0.0f);
+    const int activePeakCount = getActivePeakCount();
+    for (int i = 0; i < activePeakCount; ++i)
+        snapshot.freqsHz[(size_t) i] = topFreqsForDrawing[(size_t) i];
+
     snapshot.useQuarterToneMode = useQuarterToneMode();
     snapshot.startTimeSeconds = activeFreezeSessionOffsetSeconds
                               + (nowSeconds - activeFreezeSessionStartWallTimeSeconds);
     snapshot.endTimeSeconds = snapshot.startTimeSeconds + 0.25;
+    snapshot.visualCreatedWallTimeSeconds = nowSeconds;
 
     ++freezeCaptureCount;
     snapshot.label = "Freeze " + juce::String (freezeCaptureCount);
@@ -1009,6 +1677,10 @@ void AudioPluginAudioProcessorEditor::refreshStaffComponent()
 void AudioPluginAudioProcessorEditor::refreshExportButtonState()
 {
     exportMidiButton.setEnabled (! frozenChords.empty());
+    exportMidiButton.setButtonText (hasCompletedAutoAnalysis
+                                     && ! detailAnalysisHistory.empty()
+                                      ? "Export Combined"
+                                      : "Export MIDI");
 }
 
 void AudioPluginAudioProcessorEditor::showTransientStatusMessage (juce::String message, double seconds)
@@ -1035,25 +1707,37 @@ void AudioPluginAudioProcessorEditor::resetFrozenState()
 {
     closeActiveFrozenChord();
     isFrozen = false;
+    isAutoRunning = false;
+    isDetailPageActive = false;
+    hasCompletedAutoAnalysis = false;
     freezeCaptureCount = 0;
+    autoCaptureCount = 0;
     activeFreezeSessionStartWallTimeSeconds = 0.0;
     activeFreezeSessionOffsetSeconds = 0.0;
+    autoStartWallTimeSeconds = 0.0;
+    firstFreezeTimeLabel.clear();
     pendingFreezeMarker = false;
     transientStatusMessage.clear();
     transientStatusMessageExpirySeconds = 0.0;
     frozenChords.clear();
+    detailAnalysisHistory.clear();
     processorRef.clearLiveFrozenMidiChord();
 
     spectrumForDrawing.fill (0.0f);
     topFreqsForDrawing.fill (0.0f);
     topMagsForDrawing.fill (0.0f);
     latestSpectrum.fill (0.0f);
+    latestResidual.fill (0.0f);
+    previousAutoResidual.fill (0.0f);
     latestTopFreqs.fill (0.0f);
     latestTopMags.fill (0.0f);
 
     clearSpectrogramImage();
+    resetAutoDetectorState();
 
     refreshStaffComponent();
+    refreshAutoButtonStates();
+    refreshDetailAnalysisButtonState();
 
     repaint();
 }
@@ -1061,6 +1745,159 @@ void AudioPluginAudioProcessorEditor::resetFrozenState()
 void AudioPluginAudioProcessorEditor::clearSpectrogramImage()
 {
     spectrogramImage.clear (spectrogramImage.getBounds(), kSpectrogramBase);
+}
+
+void AudioPluginAudioProcessorEditor::drawAnalysisCurve (juce::Graphics& g,
+                                                         juce::Rectangle<int> area,
+                                                         const juce::String& title,
+                                                         const juce::String& valueText,
+                                                         float minValue,
+                                                         float maxValue,
+                                                         bool available,
+                                                         const std::function<float (const DetailAnalysisFrame&)>& valueForFrame)
+{
+    auto panel = area.toFloat();
+    g.setColour (kPanelTint.withMultipliedAlpha (available ? 0.22f : 0.10f));
+    g.fillRoundedRectangle (panel, 12.0f);
+    g.setColour (kTextPrimary.withAlpha (available ? 0.22f : 0.10f));
+    g.drawRoundedRectangle (panel.reduced (0.5f), 12.0f, 1.0f);
+
+    auto header = area.reduced (10, 8).removeFromTop (18);
+    g.setFont (makeUIFont (9.0f, true));
+    g.setColour (available ? kTextPrimary : kTextSecondary.withAlpha (0.45f));
+    g.drawText (title, header, juce::Justification::centredLeft);
+
+    g.setFont (makeUIFont (7.6f, false));
+    g.drawText (available ? valueText : "Unavailable",
+                header,
+                juce::Justification::centredRight);
+
+    auto graph = area.reduced (12, 10);
+    graph.removeFromTop (24);
+
+    g.setColour (kTextPrimary.withAlpha (0.10f));
+    for (int i = 1; i < 4; ++i)
+    {
+        const auto y = graph.getY() + graph.getHeight() * i / 4;
+        g.drawHorizontalLine (y, (float) graph.getX(), (float) graph.getRight());
+    }
+
+    if (! available || detailAnalysisHistory.size() < 2 || maxValue <= minValue)
+        return;
+
+    juce::Path curve;
+    const auto count = detailAnalysisHistory.size();
+    for (size_t i = 0; i < count; ++i)
+    {
+        const auto value = juce::jlimit (minValue, maxValue, valueForFrame (detailAnalysisHistory[i]));
+        const float x = (float) graph.getX()
+                      + (float) i * (float) graph.getWidth() / (float) juce::jmax ((size_t) 1, count - 1);
+        const float normalised = (value - minValue) / (maxValue - minValue);
+        const float y = (float) graph.getBottom() - normalised * (float) graph.getHeight();
+
+        if (i == 0)
+            curve.startNewSubPath (x, y);
+        else
+            curve.lineTo (x, y);
+    }
+
+    g.setColour (kButtonTerracottaStrong.withAlpha (0.92f));
+    g.strokePath (curve, juce::PathStrokeType (1.7f));
+}
+
+void AudioPluginAudioProcessorEditor::drawDetailAnalysisPanel (juce::Graphics& g, juce::Rectangle<int> area)
+{
+    auto panel = area.reduced (10, 8);
+    g.setColour (kPanelBackground.withAlpha (0.95f));
+    g.fillRoundedRectangle (panel.toFloat(), 16.0f);
+
+    auto header = panel.reduced (14, 10).removeFromTop (24);
+    auto headerTextArea = header.withTrimmedRight (158);
+    g.setColour (kSpectrogramLabel);
+    g.setFont (makeUIFont (12.0f, true));
+    g.drawText ("Detail Analysis", headerTextArea, juce::Justification::centredLeft);
+
+    g.setFont (makeUIFont (8.0f, false));
+    const auto duration = detailAnalysisHistory.empty() ? 0.0 : detailAnalysisHistory.back().timeSeconds;
+    g.drawText (juce::String (detailAnalysisHistory.size()) + " frames  |  "
+                + juce::String (duration, 1) + " sec",
+                headerTextArea,
+                juce::Justification::centredRight);
+
+    if (detailAnalysisHistory.empty())
+    {
+        g.setColour (kSpectrogramLabel.withAlpha (0.70f));
+        g.setFont (makeUIFont (10.0f, false));
+        g.drawText ("Run Auto Mode, then Stop to unlock analysis.",
+                    panel,
+                    juce::Justification::centred);
+        return;
+    }
+
+    const auto& latest = detailAnalysisHistory.back();
+    const bool hasStereoPan = std::any_of (detailAnalysisHistory.begin(),
+                                           detailAnalysisHistory.end(),
+                                           [] (const auto& frame) { return frame.stereoPanAvailable; });
+
+    auto grid = panel.reduced (14, 42);
+    const int gap = 10;
+    const int cellWidth = (grid.getWidth() - gap) / 2;
+    const int cellHeight = (grid.getHeight() - gap) / 2;
+
+    auto flatnessArea = juce::Rectangle<int> (grid.getX(), grid.getY(), cellWidth, cellHeight);
+    auto roughnessArea = juce::Rectangle<int> (grid.getX() + cellWidth + gap, grid.getY(), cellWidth, cellHeight);
+    auto centroidArea = juce::Rectangle<int> (grid.getX(), grid.getY() + cellHeight + gap, cellWidth, cellHeight);
+    auto panArea = juce::Rectangle<int> (grid.getX() + cellWidth + gap,
+                                         grid.getY() + cellHeight + gap,
+                                         cellWidth,
+                                         cellHeight);
+
+    drawAnalysisCurve (g,
+                       flatnessArea,
+                       "Spectral Flatness",
+                       juce::String (latest.spectralFlatness, 3),
+                       0.0f,
+                       1.0f,
+                       true,
+                       [] (const auto& frame) { return frame.spectralFlatness; });
+
+    drawAnalysisCurve (g,
+                       roughnessArea,
+                       "Roughness",
+                       juce::String (latest.roughness, 3),
+                       0.0f,
+                       1.0f,
+                       true,
+                       [] (const auto& frame) { return frame.roughness; });
+
+    drawAnalysisCurve (g,
+                       centroidArea,
+                       "Centroid",
+                       juce::String (latest.centroidHz, 0) + " Hz",
+                       0.0f,
+                       24000.0f,
+                       true,
+                       [] (const auto& frame) { return frame.centroidHz; });
+
+    drawAnalysisCurve (g,
+                       panArea,
+                       "Stereo Pan Energy",
+                       latest.stereoPanEnergy < -0.04f ? juce::String ("L ") + juce::String (std::abs (latest.stereoPanEnergy), 2)
+                         : latest.stereoPanEnergy > 0.04f ? juce::String ("R ") + juce::String (latest.stereoPanEnergy, 2)
+                                                          : juce::String ("Center"),
+                       -1.0f,
+                       1.0f,
+                       hasStereoPan,
+                       [] (const auto& frame) { return frame.stereoPanEnergy; });
+
+    if (! hasStereoPan)
+    {
+        g.setColour (kSpectrogramLabel.withAlpha (0.48f));
+        g.setFont (makeUIFont (7.8f, false));
+        g.drawText ("Mono input - no stereo field",
+                    panArea.reduced (10, 30),
+                    juce::Justification::centred);
+    }
 }
 
 //==============================================================================
@@ -1080,7 +1917,6 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
     auto spectroArea = leftPanel.removeFromTop ((int) std::round (leftPanel.getHeight() * 0.39f));
     leftPanel.removeFromTop (spectrogramBottomGap);
     auto scoreArea = leftPanel;
-    juce::ignoreUnused (scoreArea);
 
     auto titleArea = rightPanel.removeFromTop (44);
     g.setColour (kTextPrimary);
@@ -1187,12 +2023,16 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
                           2);
     }
 
+    if (isDetailPageActive)
+        drawDetailAnalysisPanel (g, scoreArea);
+
     auto inner = textArea.reduced (2, 4);
 
     g.setColour (kTextPrimary);
     g.setFont (makeUIFont (10.2f, true));
     auto peaksTitleArea = inner.removeFromTop (20);
-    g.drawText ("Top 10 Peaks",
+    const int activePeakCount = getActivePeakCount();
+    g.drawText ("Top " + juce::String (activePeakCount) + " Peaks",
                 peaksTitleArea,
                 juce::Justification::centredLeft);
 
@@ -1202,16 +2042,23 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
                 peaksTitleArea,
                 juce::Justification::centredRight);
 
+    inner.removeFromTop (2);
+    auto peakCountControlArea = inner.removeFromTop (20);
+    g.setColour (kTextSecondary);
+    g.setFont (makeUIFont (7.4f, false));
+    g.drawText ("Count",
+                peakCountControlArea.removeFromLeft (36),
+                juce::Justification::centredLeft);
     inner.removeFromTop (4);
 
     g.setFont (makeUIFont (7.8f, false));
 
     const int numCols       = 2;
-    const int rowsPerColumn = kNumNoisyPeaks / numCols;
+    const int rowsPerColumn = juce::jmax (1, (activePeakCount + numCols - 1) / numCols);
     const int colWidth   = inner.getWidth()  / numCols;
     const int lineHeight = inner.getHeight() / rowsPerColumn;
 
-    for (int i = 0; i < kNumNoisyPeaks; ++i)
+    for (int i = 0; i < activePeakCount; ++i)
     {
         int col = i / rowsPerColumn;
         int row = i % rowsPerColumn;
@@ -1241,6 +2088,28 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
                     juce::Justification::centredLeft);
     }
 
+    if (isAutoPageActive)
+    {
+        g.setColour (kTextSecondary);
+        g.setFont (makeUIFont (7.2f, false));
+        g.drawText ("Sensitivity",
+                    autoSensitivitySlider.getBounds().translated (-74, 0).withWidth (70),
+                    juce::Justification::centredRight);
+        g.drawText ("Min Gap",
+                    autoMinGapSlider.getBounds().translated (-74, 0).withWidth (70),
+                    juce::Justification::centredRight);
+
+        auto autoReadoutArea = juce::Rectangle<int> (autoClearButton.getX() - 14,
+                                                     autoClearButton.getBottom() + 2,
+                                                     autoClearButton.getWidth() + 28,
+                                                     12);
+        const auto stateText = isAutoRunning ? juce::String ("Auto running")
+                                             : juce::String ("Auto stopped");
+        g.drawText (stateText + "  |  " + juce::String (autoCaptureCount) + " captures",
+                    autoReadoutArea,
+                    juce::Justification::centred);
+    }
+
     auto infoArea = bottomInfoArea.reduced (0, 2);
     infoArea.removeFromTop (6);
     auto modeRow = infoArea.removeFromBottom (12);
@@ -1254,19 +2123,35 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
     auto hostRow = infoArea.removeFromBottom (12);
     g.setColour (kTextSecondary);
     g.setFont (makeUIFont (7.6f, false));
-    g.drawText (useQuarterToneMode() ? "Host input  |  24-TET"
-                                     : "Host input  |  12-TET",
+    const auto inputLevelDb = processorRef.getInputLevelDb();
+    const auto inputLevelText = inputLevelDb <= -119.0f
+                              ? juce::String ("Input -inf dB")
+                              : "Input " + juce::String (inputLevelDb, 1) + " dB";
+
+    g.drawText (inputLevelText + (useQuarterToneMode() ? "  |  24-TET"
+                                                       : "  |  12-TET"),
                 hostRow,
+                juce::Justification::centredRight);
+
+    auto firstFreezeRow = infoArea.removeFromBottom (12);
+    g.setColour (kTextSecondary);
+    g.setFont (makeUIFont (7.2f, false));
+    g.drawText (firstFreezeTimeLabel.isNotEmpty()
+                    ? "First Freeze: " + firstFreezeTimeLabel
+                    : "First Freeze: -",
+                firstFreezeRow,
                 juce::Justification::centredRight);
 
     auto liveRow = infoArea.removeFromBottom (18);
     auto statusPill = liveRow.removeFromRight (78);
-    g.setColour (isFrozen ? kButtonTerracottaStrong
-                          : kButtonTerracotta);
+    const auto statusText = isAutoRunning ? juce::String ("AUTO")
+                                          : (isFrozen ? juce::String ("FROZEN") : juce::String ("LIVE"));
+    g.setColour ((isFrozen || isAutoRunning) ? kButtonTerracottaStrong
+                                             : kButtonTerracotta);
     g.fillRoundedRectangle (statusPill.toFloat(), 8.0f);
     g.setColour (kButtonText);
     g.setFont (makeUIFont (8.6f, true));
-    g.drawText (isFrozen ? "FROZEN" : "LIVE",
+    g.drawText (statusText,
                 statusPill,
                 juce::Justification::centred);
 }
@@ -1295,7 +2180,24 @@ void AudioPluginAudioProcessorEditor::resized()
     clearSpectrogramImage();
 
     if (staffComponent != nullptr)
+    {
         staffComponent->setBounds (scoreArea);
+        staffComponent->setVisible (! isDetailPageActive);
+    }
+
+    if (descriptorMidiDragComponent != nullptr)
+    {
+        auto detailPanel = scoreArea.reduced (10, 8);
+        descriptorMidiDragComponent->setBounds (detailPanel.getRight() - 150,
+                                                detailPanel.getY() + 8,
+                                                150,
+                                                22);
+        descriptorMidiDragComponent->setVisible (isDetailPageActive
+                                                  && hasCompletedAutoAnalysis
+                                                  && ! detailAnalysisHistory.empty()
+                                                  && ! isAutoRunning);
+        descriptorMidiDragComponent->toFront (false);
+    }
 
     rightPanel.removeFromTop (44);
     auto rightInner = rightPanel.reduced (12);
@@ -1305,7 +2207,14 @@ void AudioPluginAudioProcessorEditor::resized()
     rightInner.removeFromBottom (8);
 
     auto controlArea = rightInner.removeFromTop (182);
-    const int buttonHeight = 30;
+    constexpr int buttonHeight = 26;
+
+    auto modeRow = controlArea.removeFromTop (24);
+    const int modeButtonWidth = (modeRow.getWidth() - 8) / 2;
+    manualModeButton.setBounds (modeRow.removeFromLeft (modeButtonWidth));
+    modeRow.removeFromLeft (8);
+    autoModeButton.setBounds (modeRow);
+    controlArea.removeFromTop (6);
 
     auto placeButton = [&controlArea] (juce::TextButton& button,
                                        int width,
@@ -1317,17 +2226,56 @@ void AudioPluginAudioProcessorEditor::resized()
         button.setBounds (x, row.getY(), width, buttonHeight);
     };
 
-    placeButton (freezeButton, 96, 2);
-    placeButton (unfreezeButton, 112, 8);
-    placeButton (resetButton, 84, 8);
-    placeButton (quarterToneButton, 130, 8);
-    placeButton (exportMidiButton, 112, 8);
+    if (isAutoPageActive)
+    {
+        placeButton (autoStartButton, 96, 0);
+        placeButton (autoStopButton, 96, 5);
+        placeButton (autoClearButton, 96, 5);
+
+        controlArea.removeFromTop (16);
+        autoSensitivitySlider.setBounds (controlArea.removeFromTop (22).withTrimmedLeft (74));
+        controlArea.removeFromTop (4);
+        autoMinGapSlider.setBounds (controlArea.removeFromTop (22).withTrimmedLeft (74));
+
+        quarterToneButton.setBounds (rightInner.getCentreX() - 65,
+                                     controlArea.getBottom() + 5,
+                                     130,
+                                     buttonHeight);
+        exportMidiButton.setBounds (rightInner.getCentreX() - 56,
+                                    quarterToneButton.getBottom() + 5,
+                                    112,
+                                    buttonHeight);
+    }
+    else
+    {
+        placeButton (freezeButton, 96, 0);
+        placeButton (unfreezeButton, 112, 5);
+        placeButton (resetButton, 84, 5);
+        placeButton (quarterToneButton, 130, 5);
+        placeButton (exportMidiButton, 112, 5);
+    }
+
+    auto peakPanel = getLocalBounds().reduced (12).removeFromRight (206).reduced (12);
+    peakPanel.removeFromTop (44);
+    peakPanel.removeFromTop (10);
+    peakPanel.removeFromBottom (54);
+    auto peakTextArea = peakPanel.removeFromBottom (148);
+    peakTextArea.removeFromTop (30);
+    auto peakInner = peakTextArea.reduced (2, 4);
+    peakInner.removeFromTop (22);
+    topPeakCountSlider.setBounds (peakInner.removeFromTop (20).withTrimmedLeft (36));
 
     bassBoostButton.setBounds (scoreArea.getX() + 18,
                                scoreArea.getBottom() - 38,
                                112,
                                buttonHeight);
     bassBoostButton.toFront (false);
+
+    detailAnalysisButton.setBounds (bassBoostButton.getRight() + 10,
+                                    scoreArea.getBottom() - 38,
+                                    132,
+                                    buttonHeight);
+    detailAnalysisButton.toFront (false);
 }
 
 
@@ -1402,12 +2350,20 @@ void AudioPluginAudioProcessorEditor::pushSpectrumToImage()
 void AudioPluginAudioProcessorEditor::timerCallback()
 {
     processorRef.getSpectrumCopy (latestSpectrum);
+    processorRef.getResidualCopy (latestResidual);
     processorRef.getTopPeaksCopy (latestTopFreqs, latestTopMags);
 
     spectrumForDrawing = latestSpectrum;
     topFreqsForDrawing = latestTopFreqs;
     topMagsForDrawing  = latestTopMags;
+
+    const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
+    recordDetailAnalysisFrame (nowSeconds);
+    processAutoOnsetDetection (nowSeconds);
     pushSpectrumToImage();
+
+    if (staffComponent != nullptr)
+        staffComponent->repaint();
 
     repaint();
 }
