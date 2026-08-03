@@ -10,8 +10,11 @@
 
 namespace
 {
-    constexpr int kMaxFrozenChords = 20;
+    constexpr int kMaxManualFrozenChords = 100;
+    constexpr int kVisibleFrozenChords = 20;
+    constexpr int kMaxAutoChordsSafety = 128;
     constexpr int kMaxDetailAnalysisFrames = 2400;
+    constexpr double kMaxAutoDurationSeconds = 30.0;
 
     const juce::Colour kEditorBackground = juce::Colour::fromRGB (156, 167, 127);
     const juce::Colour kPanelBackground = juce::Colour::fromRGB (41, 56, 49);
@@ -378,6 +381,65 @@ namespace
         int pitchWheelValue = kPitchBendCentre;
     };
 
+    struct MusicXmlPitch
+    {
+        bool valid = false;
+        juce::String step;
+        double alter = 0.0;
+        juce::String accidental;
+        int octave = 0;
+        int sortIndex = 0;
+    };
+
+    MusicXmlPitch musicXmlPitchForFrequency (float freqHz, bool useQuarterToneMode)
+    {
+        if (freqHz <= 0.0f)
+            return {};
+
+        const int quantisedIndex = useQuarterToneMode
+                                     ? (int) std::round (138.0f + 24.0f * std::log2 (freqHz / 440.0f))
+                                     : 2 * (int) std::round (69.0f + 12.0f * std::log2 (freqHz / 440.0f));
+
+        if (quantisedIndex < 0 || quantisedIndex > 255)
+            return {};
+
+        const int pitchClass = useQuarterToneMode ? quantisedIndex % 24
+                                                   : (quantisedIndex / 2) % 12;
+        const int octave = useQuarterToneMode ? quantisedIndex / 24 - 1
+                                               : (quantisedIndex / 2) / 12 - 1;
+        const auto& pitch = useQuarterToneMode ? kQuarterTonePitchClasses[pitchClass]
+                                               : kSemitonePitchClasses[pitchClass];
+
+        MusicXmlPitch result;
+        result.valid = true;
+        result.step = pitch.baseName;
+        result.octave = octave;
+        result.sortIndex = quantisedIndex;
+
+        if (std::strcmp (pitch.staffAccidental, "#") == 0)
+        {
+            result.alter = 1.0;
+            result.accidental = "sharp";
+        }
+        else if (std::strcmp (pitch.staffAccidental, "b") == 0)
+        {
+            result.alter = -1.0;
+            result.accidental = "flat";
+        }
+        else if (std::strcmp (pitch.staffAccidental, "q#") == 0)
+        {
+            result.alter = 0.5;
+            result.accidental = "quarter-sharp";
+        }
+        else if (std::strcmp (pitch.staffAccidental, "qb") == 0)
+        {
+            result.alter = -0.5;
+            result.accidental = "quarter-flat";
+        }
+
+        return result;
+    }
+
     int pitchWheelValueForSemitoneOffset (float semitoneOffset)
     {
         return juce::jlimit (0, 16383,
@@ -640,6 +702,119 @@ namespace
         return writeMidiFile ("FrozenChords", eventTrack);
     }
 
+    juce::File createMusicXmlFileForSnapshots (const std::vector<FrozenChordSnapshot>& snapshots)
+    {
+        // This is a notation-focused pitch export: each detected chord occupies
+        // one quarter note, while microtonal accidentals remain explicit.
+        juce::String xml;
+        xml << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n"
+            << "<!DOCTYPE score-partwise PUBLIC \"-//Recordare//DTD MusicXML 3.1 Partwise//EN\" "
+               "\"http://www.musicxml.org/dtds/partwise.dtd\">\n"
+            << "<score-partwise version=\"3.1\">\n"
+            << "  <work><work-title>SPEKANA Pitches</work-title></work>\n"
+            << "  <identification><encoding><software>SPEKANA</software></encoding></identification>\n"
+            << "  <part-list><score-part id=\"P1\"><part-name>SPEKANA</part-name></score-part></part-list>\n"
+            << "  <part id=\"P1\">\n";
+
+        int measureNumber = 1;
+        int beatInMeasure = 0;
+
+        const auto openMeasure = [&xml, &measureNumber] (bool firstMeasure)
+        {
+            xml << "    <measure number=\"" << measureNumber << "\">\n";
+            if (firstMeasure)
+            {
+                xml << "      <attributes>\n"
+                    << "        <divisions>1</divisions>\n"
+                    << "        <key><fifths>0</fifths></key>\n"
+                    << "        <time><beats>4</beats><beat-type>4</beat-type></time>\n"
+                    << "        <clef><sign>G</sign><line>2</line></clef>\n"
+                    << "      </attributes>\n";
+            }
+        };
+
+        const auto appendQuarterRest = [&xml]()
+        {
+            xml << "      <note><rest/><duration>1</duration><voice>1</voice><type>quarter</type></note>\n";
+        };
+
+        openMeasure (true);
+
+        for (const auto& snapshot : snapshots)
+        {
+            std::vector<MusicXmlPitch> pitches;
+            pitches.reserve (snapshot.freqsHz.size());
+
+            for (float freqHz : snapshot.freqsHz)
+            {
+                auto pitch = musicXmlPitchForFrequency (freqHz, snapshot.useQuarterToneMode);
+                if (pitch.valid)
+                    pitches.push_back (std::move (pitch));
+            }
+
+            std::sort (pitches.begin(), pitches.end(),
+                       [] (const auto& a, const auto& b) { return a.sortIndex < b.sortIndex; });
+            pitches.erase (std::unique (pitches.begin(), pitches.end(),
+                                        [] (const auto& a, const auto& b)
+                                        {
+                                            return a.sortIndex == b.sortIndex;
+                                        }),
+                           pitches.end());
+
+            if (pitches.empty())
+            {
+                appendQuarterRest();
+            }
+            else
+            {
+                for (size_t noteIndex = 0; noteIndex < pitches.size(); ++noteIndex)
+                {
+                    const auto& pitch = pitches[noteIndex];
+                    xml << "      <note>\n";
+                    if (noteIndex > 0)
+                        xml << "        <chord/>\n";
+
+                    xml << "        <pitch><step>" << pitch.step << "</step>";
+                    if (pitch.alter != 0.0)
+                        xml << "<alter>" << juce::String (pitch.alter, 1) << "</alter>";
+                    xml << "<octave>" << pitch.octave << "</octave></pitch>\n"
+                        << "        <duration>1</duration><voice>1</voice><type>quarter</type>\n";
+
+                    if (pitch.accidental.isNotEmpty())
+                        xml << "        <accidental>" << pitch.accidental << "</accidental>\n";
+
+                    xml << "      </note>\n";
+                }
+            }
+
+            if (++beatInMeasure == 4)
+            {
+                xml << "    </measure>\n";
+                ++measureNumber;
+                beatInMeasure = 0;
+                if (&snapshot != &snapshots.back())
+                    openMeasure (false);
+            }
+        }
+
+        if (beatInMeasure > 0)
+        {
+            while (beatInMeasure++ < 4)
+                appendQuarterRest();
+            xml << "    </measure>\n";
+        }
+
+        xml << "  </part>\n</score-partwise>\n";
+
+        auto xmlFilePath = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                               .getNonexistentChildFile ("SPEKANA_Pitches", ".musicxml", false);
+
+        if (auto stream = xmlFilePath.createOutputStream())
+            stream->writeText (xml, false, false, "\n");
+
+        return xmlFilePath;
+    }
+
     juce::File createDescriptorMidiFile (const std::vector<DetailAnalysisFrame>& frames,
                                          double timeScale)
     {
@@ -660,12 +835,126 @@ namespace
     }
 }
 
-class FrozenChordStaffComponent : public juce::Component
+class AutoDetectionXYPad : public juce::Component
 {
 public:
+    float getSensitivity() const noexcept
+    {
+        return juce::jmap (sensitivityPosition, 1.0f, 8.0f);
+    }
+
+    double getMinGapMs() const noexcept
+    {
+        constexpr double shortestGapMs = 250.0;
+        constexpr double longestGapMs = 1500.0;
+        return longestGapMs * std::pow (shortestGapMs / longestGapMs,
+                                       (double) captureRatePosition);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto bounds = getLocalBounds().toFloat();
+        g.setColour (kPanelTint.withMultipliedAlpha (0.16f));
+        g.fillRoundedRectangle (bounds, 7.0f);
+        g.setColour (kTextPrimary.withAlpha (0.16f));
+        g.drawRoundedRectangle (bounds.reduced (0.5f), 7.0f, 1.0f);
+
+        const auto plot = getPlotBounds();
+        g.setColour (kTextPrimary.withAlpha (0.10f));
+        g.drawRect (plot, 0.8f);
+        g.drawLine (plot.getX(), plot.getCentreY(), plot.getRight(), plot.getCentreY(), 0.7f);
+        g.drawLine (plot.getCentreX(), plot.getY(), plot.getCentreX(), plot.getBottom(), 0.7f);
+
+        const juce::Point<float> origin { plot.getX(), plot.getBottom() };
+        const juce::Point<float> point {
+            plot.getX() + sensitivityPosition * plot.getWidth(),
+            plot.getBottom() - captureRatePosition * plot.getHeight()
+        };
+
+        g.setColour (kButtonTerracotta.withAlpha (0.54f));
+        g.drawLine ({ origin, point }, 1.3f);
+        g.fillEllipse (juce::Rectangle<float> (7.0f, 7.0f).withCentre (point));
+
+        g.setColour (kTextSecondary.withAlpha (0.78f));
+        g.setFont (makeUIFont (6.1f, true));
+        g.drawText ("SENSITIVE",
+                    getLocalBounds().removeFromTop (10).removeFromRight (62).reduced (3, 0),
+                    juce::Justification::centredRight);
+        g.drawText ("NON-SENSITIVE",
+                    getLocalBounds().removeFromBottom (10).removeFromLeft (76).reduced (3, 0),
+                    juce::Justification::centredLeft);
+    }
+
+    void mouseDown (const juce::MouseEvent& event) override
+    {
+        updateFromMouse (event.position);
+    }
+
+    void mouseDrag (const juce::MouseEvent& event) override
+    {
+        updateFromMouse (event.position);
+    }
+
+private:
+    float sensitivityPosition = 5.0f / 7.0f; // Default sensitivity: 6.0.
+    float captureRatePosition = (float) (std::log (400.0 / 1500.0)
+                                          / std::log (250.0 / 1500.0));
+
+    juce::Rectangle<float> getPlotBounds() const
+    {
+        auto plot = getLocalBounds().toFloat().reduced (8.0f);
+        plot.removeFromTop (4.0f);
+        plot.removeFromBottom (4.0f);
+        return plot;
+    }
+
+    void updateFromMouse (juce::Point<float> position)
+    {
+        const auto plot = getPlotBounds();
+        sensitivityPosition = juce::jlimit (0.0f, 1.0f,
+                                            (position.x - plot.getX()) / plot.getWidth());
+        captureRatePosition = juce::jlimit (0.0f, 1.0f,
+                                            (plot.getBottom() - position.y) / plot.getHeight());
+        repaint();
+    }
+};
+
+class FrozenChordStaffComponent : public juce::Component,
+                                  private juce::ScrollBar::Listener
+{
+public:
+    FrozenChordStaffComponent()
+        : horizontalScrollBar (false)
+    {
+        addAndMakeVisible (horizontalScrollBar);
+        horizontalScrollBar.setAutoHide (true);
+        horizontalScrollBar.setSingleStepSize (1.0);
+        horizontalScrollBar.setColour (juce::ScrollBar::backgroundColourId,
+                                       juce::Colours::transparentBlack);
+        horizontalScrollBar.setColour (juce::ScrollBar::thumbColourId,
+                                       kTextPrimary.withAlpha (0.22f));
+        horizontalScrollBar.setColour (juce::ScrollBar::trackColourId,
+                                       kTextPrimary.withAlpha (0.06f));
+        horizontalScrollBar.addListener (this);
+        updateScrollBar (true);
+    }
+
+    ~FrozenChordStaffComponent() override
+    {
+        horizontalScrollBar.removeListener (this);
+    }
+
     void setSnapshots (std::vector<FrozenChordSnapshot> newSnapshots)
     {
+        const double previousLatestStart = juce::jmax (0.0,
+                                                       (double) snapshots.size()
+                                                         - (double) kVisibleFrozenChords);
+        const bool shouldFollowLatest = snapshots.empty()
+                                     || horizontalScrollBar.getCurrentRangeStart()
+                                          >= previousLatestStart - 0.5;
+
         snapshots = std::move (newSnapshots);
+        updateScrollBar (shouldFollowLatest);
         repaint();
     }
 
@@ -677,6 +966,9 @@ public:
     void paint (juce::Graphics& g) override
     {
         auto bounds = getLocalBounds().reduced (10);
+        if (horizontalScrollBar.isVisible())
+            bounds.removeFromBottom (12);
+
         auto header = bounds.removeFromTop (26);
 
         header.removeFromLeft (72);
@@ -693,34 +985,73 @@ public:
         drawContinuousSystem (g, systemBounds);
     }
 
+    void resized() override
+    {
+        constexpr int scrollBarHeight = 7;
+        constexpr int buttonTopInset = 38;
+        constexpr int gapAboveButtons = 10;
+        horizontalScrollBar.setBounds (12,
+                                       getHeight() - buttonTopInset - gapAboveButtons - scrollBarHeight,
+                                       juce::jmax (0, getWidth() - 24),
+                                       scrollBarHeight);
+    }
+
     void mouseDown (const juce::MouseEvent& event) override
     {
         dragTriggered = false;
         dragCandidate = dragMidiBounds.contains (event.getPosition());
+        scrollDragCandidate = ! dragCandidate && horizontalScrollBar.isVisible();
+        scrollDragStartX = event.x;
+        scrollRangeStartAtDrag = horizontalScrollBar.getCurrentRangeStart();
     }
 
     void mouseDrag (const juce::MouseEvent& event) override
     {
-        if (! dragCandidate || dragTriggered || snapshots.empty())
+        if (dragCandidate)
+        {
+            if (dragTriggered || snapshots.empty() || event.getDistanceFromDragStart() < 6)
+                return;
+
+            auto midiFile = createMidiFileForSnapshots (snapshots, midiTimeScale);
+            if (! midiFile.existsAsFile())
+                return;
+
+            dragTriggered = true;
+            juce::DragAndDropContainer::performExternalDragDropOfFiles (
+                juce::StringArray { midiFile.getFullPathName() },
+                false,
+                this);
+            return;
+        }
+
+        if (! scrollDragCandidate)
             return;
 
-        if (event.getDistanceFromDragStart() < 6)
-            return;
-
-        auto midiFile = createMidiFileForSnapshots (snapshots, midiTimeScale);
-        if (! midiFile.existsAsFile())
-            return;
-
-        dragTriggered = true;
-        juce::DragAndDropContainer::performExternalDragDropOfFiles (
-            juce::StringArray { midiFile.getFullPathName() },
-            false,
-            this);
+        const float availableWidth = (float) juce::jmax (1, getWidth() - 40);
+        const float pixelsPerChord = availableWidth / (float) juce::jmax (1, kVisibleFrozenChords - 1);
+        const double chordDelta = (double) (event.x - scrollDragStartX) / (double) pixelsPerChord;
+        horizontalScrollBar.setCurrentRangeStart (scrollRangeStartAtDrag - chordDelta,
+                                                  juce::sendNotificationSync);
     }
 
     void mouseUp (const juce::MouseEvent&) override
     {
         dragCandidate = false;
+        scrollDragCandidate = false;
+    }
+
+    void mouseWheelMove (const juce::MouseEvent&,
+                         const juce::MouseWheelDetails& wheel) override
+    {
+        if (! horizontalScrollBar.isVisible())
+            return;
+
+        const float wheelDelta = std::abs (wheel.deltaX) > std::abs (wheel.deltaY)
+                                   ? wheel.deltaX
+                                   : wheel.deltaY;
+        horizontalScrollBar.setCurrentRangeStart (
+            horizontalScrollBar.getCurrentRangeStart() - (double) wheelDelta * 4.0,
+            juce::sendNotificationSync);
     }
 
 private:
@@ -732,10 +1063,36 @@ private:
     };
 
     std::vector<FrozenChordSnapshot> snapshots;
+    juce::ScrollBar horizontalScrollBar;
     juce::Rectangle<int> dragMidiBounds;
     bool dragCandidate = false;
     bool dragTriggered = false;
+    bool scrollDragCandidate = false;
+    int scrollDragStartX = 0;
+    double scrollRangeStartAtDrag = 0.0;
     double midiTimeScale = 1.0;
+
+    void scrollBarMoved (juce::ScrollBar*, double) override
+    {
+        repaint();
+    }
+
+    void updateScrollBar (bool shouldFollowLatest)
+    {
+        const double totalSlots = juce::jmax (1.0, (double) snapshots.size());
+        const double visibleSlots = juce::jmin ((double) kVisibleFrozenChords, totalSlots);
+        const double latestStart = juce::jmax (0.0, totalSlots - visibleSlots);
+        const double requestedStart = shouldFollowLatest
+                                        ? latestStart
+                                        : juce::jmin (horizontalScrollBar.getCurrentRangeStart(),
+                                                      latestStart);
+
+        horizontalScrollBar.setRangeLimits (0.0, totalSlots, juce::dontSendNotification);
+        horizontalScrollBar.setCurrentRange (requestedStart,
+                                             visibleSlots,
+                                             juce::dontSendNotification);
+        horizontalScrollBar.setVisible (totalSlots > visibleSlots);
+    }
 
     void drawContinuousSystem (juce::Graphics& g, juce::Rectangle<int> area) const
     {
@@ -788,12 +1145,18 @@ private:
 
         const float startX = left + 8.0f;
         const float availableWidth = right - startX - 8.0f;
-        const float step = availableWidth / (float) juce::jmax (1, kMaxFrozenChords - 1);
+        const float step = availableWidth / (float) juce::jmax (1, kVisibleFrozenChords - 1);
         const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
+        const size_t firstVisibleIndex = juce::jmin (
+            snapshots.size() - 1,
+            (size_t) std::floor (horizontalScrollBar.getCurrentRangeStart() + 0.5));
+        const size_t visibleCount = juce::jmin ((size_t) kVisibleFrozenChords,
+                                               snapshots.size() - firstVisibleIndex);
 
-        for (size_t i = 0; i < snapshots.size(); ++i)
+        for (size_t visibleIndex = 0; visibleIndex < visibleCount; ++visibleIndex)
         {
-            const float x = startX + step * (float) i;
+            const size_t i = firstVisibleIndex + visibleIndex;
+            const float x = startX + step * (float) visibleIndex;
             const auto notes = chordToPitchNotation (snapshots[i]);
             if (notes.empty())
                 continue;
@@ -821,7 +1184,7 @@ private:
 
             drawChord (g, content, notes, x, chordAlpha);
 
-            if (i + 1 < (size_t) kMaxFrozenChords)
+            if (visibleIndex + 1 < visibleCount)
             {
                 const float barlineX = x + step * 0.5f;
                 g.setColour (kTextPrimary.withAlpha (0.20f));
@@ -1140,8 +1503,9 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     addAndMakeVisible (autoClearButton);
     addAndMakeVisible (detailAnalysisButton);
     addAndMakeVisible (topPeakCountSlider);
-    addAndMakeVisible (autoSensitivitySlider);
-    addAndMakeVisible (autoMinGapSlider);
+
+    autoDetectionPad = std::make_unique<AutoDetectionXYPad>();
+    addAndMakeVisible (*autoDetectionPad);
 
     staffComponent = std::make_unique<FrozenChordStaffComponent>();
     addAndMakeVisible (*staffComponent);
@@ -1191,17 +1555,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     autoStopButton.onClick = [this]()
     {
         const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
-        if (! frozenChords.empty() && frozenChords.back().label.startsWith ("Auto "))
-            frozenChords.back().endTimeSeconds = juce::jmax (frozenChords.back().startTimeSeconds + 0.05,
-                                                             nowSeconds - autoStartWallTimeSeconds);
-
-        isAutoRunning = false;
-        hasCompletedAutoAnalysis = ! detailAnalysisHistory.empty();
-        refreshStaffComponent();
-        refreshAutoButtonStates();
-        refreshDetailAnalysisButtonState();
-        showTransientStatusMessage ("Auto stopped.");
-        repaint();
+        finishAutoAnalysis (nowSeconds, "Auto stopped.", false);
     };
 
     autoClearButton.onClick = [this]()
@@ -1248,26 +1602,6 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     {
         repaint();
     };
-
-    autoSensitivitySlider.setRange (1.0, 10.0, 0.5);
-    autoSensitivitySlider.setValue (7.0, juce::dontSendNotification);
-    autoSensitivitySlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    autoSensitivitySlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 34, 16);
-    autoSensitivitySlider.setColour (juce::Slider::trackColourId, kButtonTerracotta);
-    autoSensitivitySlider.setColour (juce::Slider::thumbColourId, kButtonTerracottaStrong);
-    autoSensitivitySlider.setColour (juce::Slider::backgroundColourId, kPanelTint.withMultipliedAlpha (0.35f));
-    autoSensitivitySlider.setColour (juce::Slider::textBoxTextColourId, kTextPrimary);
-    autoSensitivitySlider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
-
-    autoMinGapSlider.setRange (80.0, 600.0, 10.0);
-    autoMinGapSlider.setValue (180.0, juce::dontSendNotification);
-    autoMinGapSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    autoMinGapSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 34, 16);
-    autoMinGapSlider.setColour (juce::Slider::trackColourId, kButtonTerracotta);
-    autoMinGapSlider.setColour (juce::Slider::thumbColourId, kButtonTerracottaStrong);
-    autoMinGapSlider.setColour (juce::Slider::backgroundColourId, kPanelTint.withMultipliedAlpha (0.35f));
-    autoMinGapSlider.setColour (juce::Slider::textBoxTextColourId, kTextPrimary);
-    autoMinGapSlider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
 
     midiTimeScaleSelector->onTimeScaleChanged = [this] (double timeScale)
     {
@@ -1339,44 +1673,61 @@ unfreezeButton.onClick = [this]()
 
     exportMidiButton.onClick = [this]()
     {
-        const bool includeDescriptors = hasCompletedAutoAnalysis
-                                     && ! detailAnalysisHistory.empty();
-        const double timeScale = midiTimeScaleSelector != nullptr
-                                   ? midiTimeScaleSelector->getTimeScale()
-                                   : 1.0;
-        auto midiFile = includeDescriptors
-                          ? createCombinedMidiFile (frozenChords, detailAnalysisHistory, timeScale)
-                          : createMidiFileForSnapshots (frozenChords, timeScale);
-        if (! midiFile.existsAsFile())
-            return;
+        juce::PopupMenu exportMenu;
+        exportMenu.addItem (1, "MIDI (.mid)");
+        exportMenu.addItem (2, "MusicXML (.musicxml)");
 
-        exportMidiChooser = std::make_unique<juce::FileChooser> (
-            includeDescriptors ? "Export Combined Notes and Descriptors MIDI"
-                               : "Export Frozen Chords MIDI",
-            juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
-                .getNonexistentChildFile (includeDescriptors ? "SPEKANA_Combined"
-                                                             : "FrozenChords",
-                                          ".mid",
-                                          false),
-            "*.mid");
+        exportMenu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (exportMidiButton),
+                                  [this] (int result)
+                                  {
+                                      if (result == 0)
+                                          return;
 
-        exportMidiChooser->launchAsync (juce::FileBrowserComponent::saveMode
+                                      const bool exportMusicXml = result == 2;
+                                      const double timeScale = midiTimeScaleSelector != nullptr
+                                                                 ? midiTimeScaleSelector->getTimeScale()
+                                                                 : 1.0;
+                                      const auto sourceFile = exportMusicXml
+                                                                ? createMusicXmlFileForSnapshots (frozenChords)
+                                                                : createMidiFileForSnapshots (frozenChords,
+                                                                                              timeScale);
+                                      if (! sourceFile.existsAsFile())
+                                          return;
+
+                                      const juce::String extension = exportMusicXml ? ".musicxml" : ".mid";
+                                      const juce::String wildcard = exportMusicXml ? "*.musicxml;*.xml" : "*.mid";
+                                      const juce::String title = exportMusicXml
+                                                                   ? "Export Pitch MusicXML"
+                                                                   : "Export Pitch MIDI";
+
+                                      exportFileChooser = std::make_unique<juce::FileChooser> (
+                                          title,
+                                          juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                                              .getNonexistentChildFile ("SPEKANA_Pitches", extension, false),
+                                          wildcard);
+
+                                      exportFileChooser->launchAsync (
+                                          juce::FileBrowserComponent::saveMode
                                             | juce::FileBrowserComponent::canSelectFiles,
-                                        [this, midiFile] (const juce::FileChooser& chooser)
-                                        {
-                                            auto target = chooser.getResult();
-                                            if (target == juce::File())
-                                            {
-                                                exportMidiChooser.reset();
-                                                return;
-                                            }
+                                          [this, sourceFile, extension] (const juce::FileChooser& chooser)
+                                          {
+                                              auto target = chooser.getResult();
+                                              if (target == juce::File())
+                                              {
+                                                  exportFileChooser.reset();
+                                                  return;
+                                              }
 
-                                            if (target.existsAsFile())
-                                                target.deleteFile();
+                                              if (target.getFileExtension().isEmpty())
+                                                  target = target.withFileExtension (extension);
 
-                                            midiFile.copyFileTo (target);
-                                            exportMidiChooser.reset();
-                                        });
+                                              if (target.existsAsFile())
+                                                  target.deleteFile();
+
+                                              sourceFile.copyFileTo (target);
+                                              exportFileChooser.reset();
+                                          });
+                                  });
     };
 
     refreshExportButtonState();
@@ -1437,15 +1788,7 @@ void AudioPluginAudioProcessorEditor::setAutoPageActive (bool shouldUseAutoPage)
     if (! shouldUseAutoPage && isAutoRunning)
     {
         const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
-        if (! frozenChords.empty() && frozenChords.back().label.startsWith ("Auto "))
-            frozenChords.back().endTimeSeconds = juce::jmax (frozenChords.back().startTimeSeconds + 0.05,
-                                                             nowSeconds - autoStartWallTimeSeconds);
-
-        isAutoRunning = false;
-        hasCompletedAutoAnalysis = ! detailAnalysisHistory.empty();
-        processorRef.clearLiveFrozenMidiChord();
-        refreshAutoButtonStates();
-        refreshDetailAnalysisButtonState();
+        finishAutoAnalysis (nowSeconds, "Auto stopped.", true);
     }
 
     isAutoPageActive = shouldUseAutoPage;
@@ -1471,8 +1814,8 @@ void AudioPluginAudioProcessorEditor::refreshModeButtonStates()
     autoStartButton.setVisible (isAutoPageActive);
     autoStopButton.setVisible (isAutoPageActive);
     autoClearButton.setVisible (isAutoPageActive);
-    autoSensitivitySlider.setVisible (isAutoPageActive);
-    autoMinGapSlider.setVisible (isAutoPageActive);
+    if (autoDetectionPad != nullptr)
+        autoDetectionPad->setVisible (isAutoPageActive);
 }
 
 void AudioPluginAudioProcessorEditor::refreshAutoButtonStates()
@@ -1485,8 +1828,10 @@ void AudioPluginAudioProcessorEditor::refreshAutoButtonStates()
 void AudioPluginAudioProcessorEditor::resetAutoDetectorState()
 {
     previousAutoResidual.fill (0.0f);
+    previousDetailSpectrum.fill (0.0f);
     hasPreviousAutoResidual = false;
     hasPreviousAutoInputLevel = false;
+    hasPreviousDetailSpectrum = false;
     autoFluxMean = 0.0f;
     autoFluxDeviation = 0.18f;
     autoOnsetStrength = 0.0f;
@@ -1494,10 +1839,32 @@ void AudioPluginAudioProcessorEditor::resetAutoDetectorState()
     lastAutoOnsetWallTimeSeconds = -10.0;
 }
 
-DetailAnalysisFrame AudioPluginAudioProcessorEditor::calculateDetailAnalysisFrame (double nowSeconds) const
+void AudioPluginAudioProcessorEditor::finishAutoAnalysis (double nowSeconds,
+                                                          const juce::String& statusMessage,
+                                                          bool clearLiveChord)
+{
+    if (! frozenChords.empty() && frozenChords.back().label.startsWith ("Auto "))
+        frozenChords.back().endTimeSeconds = juce::jmax (frozenChords.back().startTimeSeconds + 0.05,
+                                                         nowSeconds - autoStartWallTimeSeconds);
+
+    isAutoRunning = false;
+    hasCompletedAutoAnalysis = ! detailAnalysisHistory.empty();
+
+    if (clearLiveChord)
+        processorRef.clearLiveFrozenMidiChord();
+
+    refreshStaffComponent();
+    refreshAutoButtonStates();
+    refreshDetailAnalysisButtonState();
+    showTransientStatusMessage (statusMessage);
+    repaint();
+}
+
+DetailAnalysisFrame AudioPluginAudioProcessorEditor::calculateDetailAnalysisFrame (double nowSeconds)
 {
     DetailAnalysisFrame frame;
     frame.timeSeconds = juce::jmax (0.0, nowSeconds - autoStartWallTimeSeconds);
+    frame.rmsDb = processorRef.getInputLevelDb();
     frame.stereoPanAvailable = processorRef.getStereoPanAvailable();
     frame.stereoPanEnergy = processorRef.getStereoPanEnergy();
 
@@ -1516,6 +1883,7 @@ DetailAnalysisFrame AudioPluginAudioProcessorEditor::calculateDetailAnalysisFram
     double magnitudeSum = 0.0;
     double weightedFrequencySum = 0.0;
     int magnitudeCount = 0;
+    std::array<float, kFftSize / 2> normalisedSpectrum {};
 
     for (int bin = minBin; bin <= maxBin; ++bin)
     {
@@ -1523,6 +1891,7 @@ DetailAnalysisFrame AudioPluginAudioProcessorEditor::calculateDetailAnalysisFram
         const double magnitude = juce::jmax (1.0e-12, std::pow (10.0, (double) db / 20.0));
         const double hz = (double) bin * sampleRate / (double) kFftSize;
 
+        normalisedSpectrum[(size_t) bin] = (float) magnitude;
         logMagnitudeSum += std::log (magnitude);
         magnitudeSum += magnitude;
         weightedFrequencySum += hz * magnitude;
@@ -1537,6 +1906,30 @@ DetailAnalysisFrame AudioPluginAudioProcessorEditor::calculateDetailAnalysisFram
         frame.centroidHz = (float) juce::jlimit (0.0, (double) sampleRate * 0.5,
                                                 weightedFrequencySum / magnitudeSum);
     }
+
+    if (magnitudeSum > 1.0e-12)
+    {
+        // L1-normalise each spectrum so flux describes spectral-shape motion
+        // rather than duplicating the RMS level. Half-wave rectification keeps
+        // only bins whose magnitude increased since the previous analysis frame.
+        double positiveFlux = 0.0;
+        for (int bin = minBin; bin <= maxBin; ++bin)
+        {
+            const float currentMagnitude = normalisedSpectrum[(size_t) bin]
+                                         / (float) magnitudeSum;
+            normalisedSpectrum[(size_t) bin] = currentMagnitude;
+
+            if (hasPreviousDetailSpectrum)
+                positiveFlux += juce::jmax (0.0f,
+                                            currentMagnitude
+                                              - previousDetailSpectrum[(size_t) bin]);
+        }
+
+        frame.spectralFlux = (float) juce::jlimit (0.0, 1.0, positiveFlux);
+    }
+
+    previousDetailSpectrum = normalisedSpectrum;
+    hasPreviousDetailSpectrum = true;
 
     struct Partial
     {
@@ -1617,13 +2010,11 @@ void AudioPluginAudioProcessorEditor::refreshDetailAnalysisButtonState()
 
 void AudioPluginAudioProcessorEditor::captureAutoChord (double nowSeconds)
 {
-    if ((int) frozenChords.size() >= kMaxFrozenChords)
+    if (autoCaptureCount >= kMaxAutoChordsSafety)
     {
-        isAutoRunning = false;
-        processorRef.clearLiveFrozenMidiChord();
-        showTransientStatusMessage ("20 chords max reached. Press Clear to start a new score.");
-        refreshAutoButtonStates();
-        refreshStaffComponent();
+        finishAutoAnalysis (nowSeconds,
+                            "Auto safety limit reached. Press Clear to start a new score.",
+                            true);
         return;
     }
 
@@ -1664,13 +2055,16 @@ void AudioPluginAudioProcessorEditor::processAutoOnsetDetection (double nowSecon
     if (! isAutoPageActive || ! isAutoRunning)
         return;
 
-    if ((int) frozenChords.size() >= kMaxFrozenChords)
+    const double elapsedSeconds = nowSeconds - autoStartWallTimeSeconds;
+    if (elapsedSeconds >= kMaxAutoDurationSeconds)
     {
-        isAutoRunning = false;
-        processorRef.clearLiveFrozenMidiChord();
-        refreshAutoButtonStates();
-        showTransientStatusMessage ("20 chords max reached. Auto stopped.");
-        repaint();
+        finishAutoAnalysis (nowSeconds, "30 second limit reached. Auto stopped.", true);
+        return;
+    }
+
+    if (autoCaptureCount >= kMaxAutoChordsSafety)
+    {
+        finishAutoAnalysis (nowSeconds, "Auto safety limit reached.", true);
         return;
     }
 
@@ -1731,8 +2125,10 @@ void AudioPluginAudioProcessorEditor::processAutoOnsetDetection (double nowSecon
             autoFluxDeviation = 0.985f * autoFluxDeviation
                               + 0.015f * std::abs (autoOnsetStrength - previousMean);
 
-            const float sensitivity = (float) autoSensitivitySlider.getValue();
-            const float thresholdScale = juce::jmap (sensitivity, 1.0f, 10.0f, 3.2f, 0.65f);
+            const float sensitivity = autoDetectionPad != nullptr
+                                        ? autoDetectionPad->getSensitivity()
+                                        : 6.0f;
+            const float thresholdScale = juce::jmap (sensitivity, 1.0f, 8.0f, 3.2f, 1.1f);
             threshold = autoFluxMean + thresholdScale * juce::jmax (0.18f, autoFluxDeviation);
             spectralOnsetDetected = autoOnsetStrength > threshold && autoOnsetStrength > 0.28f;
         }
@@ -1741,7 +2137,9 @@ void AudioPluginAudioProcessorEditor::processAutoOnsetDetection (double nowSecon
     previousAutoResidual = latestResidual;
     hasPreviousAutoResidual = true;
 
-    const double minGapSeconds = autoMinGapSlider.getValue() * 0.001;
+    const double minGapSeconds = (autoDetectionPad != nullptr
+                                    ? autoDetectionPad->getMinGapMs()
+                                    : 400.0) * 0.001;
     const bool outsideRefractory = (nowSeconds - lastAutoOnsetWallTimeSeconds) >= minGapSeconds;
 
     if (outsideRefractory && (spectralOnsetDetected || significantLevelRise))
@@ -1765,11 +2163,12 @@ void AudioPluginAudioProcessorEditor::captureFrozenChord()
 {
     const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
 
-    if ((int) frozenChords.size() >= kMaxFrozenChords)
+    if ((int) frozenChords.size() >= kMaxManualFrozenChords)
     {
         isFrozen = false;
         processorRef.clearLiveFrozenMidiChord();
-        showTransientStatusMessage ("20 chords max reached. Press Reset to start a new score.");
+        showTransientStatusMessage (juce::String (kMaxManualFrozenChords)
+                                      + " chords max reached. Press Reset to start a new score.");
         refreshStaffComponent();
         return;
     }
@@ -1809,10 +2208,7 @@ void AudioPluginAudioProcessorEditor::refreshStaffComponent()
 void AudioPluginAudioProcessorEditor::refreshExportButtonState()
 {
     exportMidiButton.setEnabled (! frozenChords.empty());
-    exportMidiButton.setButtonText (hasCompletedAutoAnalysis
-                                     && ! detailAnalysisHistory.empty()
-                                      ? "Export Combined"
-                                      : "Export MIDI");
+    exportMidiButton.setButtonText ("Export Pitch");
 }
 
 void AudioPluginAudioProcessorEditor::showTransientStatusMessage (juce::String message, double seconds)
@@ -1980,14 +2376,25 @@ void AudioPluginAudioProcessorEditor::drawDetailAnalysisPanel (juce::Graphics& g
                                            [] (const auto& frame) { return frame.stereoPanAvailable; });
 
     auto grid = panel.reduced (14, 42);
-    const int gap = 10;
-    const int cellWidth = (grid.getWidth() - gap) / 2;
+    const int gap = 8;
+    const int cellWidth = (grid.getWidth() - gap * 2) / 3;
     const int cellHeight = (grid.getHeight() - gap) / 2;
 
     auto flatnessArea = juce::Rectangle<int> (grid.getX(), grid.getY(), cellWidth, cellHeight);
     auto roughnessArea = juce::Rectangle<int> (grid.getX() + cellWidth + gap, grid.getY(), cellWidth, cellHeight);
-    auto centroidArea = juce::Rectangle<int> (grid.getX(), grid.getY() + cellHeight + gap, cellWidth, cellHeight);
-    auto panArea = juce::Rectangle<int> (grid.getX() + cellWidth + gap,
+    auto fluxArea = juce::Rectangle<int> (grid.getX() + (cellWidth + gap) * 2,
+                                          grid.getY(),
+                                          cellWidth,
+                                          cellHeight);
+    auto centroidArea = juce::Rectangle<int> (grid.getX(),
+                                              grid.getY() + cellHeight + gap,
+                                              cellWidth,
+                                              cellHeight);
+    auto rmsArea = juce::Rectangle<int> (grid.getX() + cellWidth + gap,
+                                         grid.getY() + cellHeight + gap,
+                                         cellWidth,
+                                         cellHeight);
+    auto panArea = juce::Rectangle<int> (grid.getX() + (cellWidth + gap) * 2,
                                          grid.getY() + cellHeight + gap,
                                          cellWidth,
                                          cellHeight);
@@ -2011,6 +2418,15 @@ void AudioPluginAudioProcessorEditor::drawDetailAnalysisPanel (juce::Graphics& g
                        [] (const auto& frame) { return frame.roughness; });
 
     drawAnalysisCurve (g,
+                       fluxArea,
+                       "Spectral Flux",
+                       juce::String (latest.spectralFlux, 3),
+                       0.0f,
+                       1.0f,
+                       true,
+                       [] (const auto& frame) { return frame.spectralFlux; });
+
+    drawAnalysisCurve (g,
                        centroidArea,
                        "Centroid",
                        juce::String (latest.centroidHz, 0) + " Hz",
@@ -2018,6 +2434,16 @@ void AudioPluginAudioProcessorEditor::drawDetailAnalysisPanel (juce::Graphics& g
                        24000.0f,
                        true,
                        [] (const auto& frame) { return frame.centroidHz; });
+
+    drawAnalysisCurve (g,
+                       rmsArea,
+                       "RMS Level",
+                       latest.rmsDb <= -119.0f ? juce::String ("-inf dB")
+                                               : juce::String (latest.rmsDb, 1) + " dB",
+                       -96.0f,
+                       6.0f,
+                       true,
+                       [] (const auto& frame) { return frame.rmsDb; });
 
     drawAnalysisCurve (g,
                        panArea,
@@ -2230,15 +2656,6 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
 
     if (isAutoPageActive)
     {
-        g.setColour (kTextSecondary);
-        g.setFont (makeUIFont (7.2f, false));
-        g.drawText ("Sensitivity",
-                    autoSensitivitySlider.getBounds().translated (-74, 0).withWidth (70),
-                    juce::Justification::centredRight);
-        g.drawText ("Min Gap",
-                    autoMinGapSlider.getBounds().translated (-74, 0).withWidth (70),
-                    juce::Justification::centredRight);
-
         auto autoReadoutArea = juce::Rectangle<int> (autoClearButton.getX() - 14,
                                                      autoClearButton.getBottom() + 2,
                                                      autoClearButton.getWidth() + 28,
@@ -2382,9 +2799,8 @@ void AudioPluginAudioProcessorEditor::resized()
         placeButton (autoClearButton, 96, 5);
 
         controlArea.removeFromTop (16);
-        autoSensitivitySlider.setBounds (controlArea.removeFromTop (22).withTrimmedLeft (74));
-        controlArea.removeFromTop (4);
-        autoMinGapSlider.setBounds (controlArea.removeFromTop (22).withTrimmedLeft (74));
+        if (autoDetectionPad != nullptr)
+            autoDetectionPad->setBounds (controlArea.removeFromTop (48).reduced (5, 0));
 
         quarterToneButton.setBounds (rightInner.getCentreX() - 65,
                                      controlArea.getBottom() + 5,

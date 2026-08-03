@@ -11,6 +11,7 @@ class AudioPluginAudioProcessor;
 class FrozenChordStaffComponent;
 class DescriptorMidiDragComponent;
 class MidiTimeScaleSelector;
+class AutoDetectionXYPad;
 
 struct FrozenChordSnapshot
 {
@@ -27,7 +28,9 @@ struct DetailAnalysisFrame
     double timeSeconds = 0.0;
     float spectralFlatness = 0.0f;
     float roughness = 0.0f;
+    float spectralFlux = 0.0f;
     float centroidHz = 0.0f;
+    float rmsDb = -120.0f;
     float stereoPanEnergy = 0.0f;
     bool stereoPanAvailable = false;
 };
@@ -52,8 +55,11 @@ private:
     void refreshModeButtonStates();
     void refreshAutoButtonStates();
     void resetAutoDetectorState();
+    void finishAutoAnalysis (double nowSeconds,
+                             const juce::String& statusMessage,
+                             bool clearLiveChord);
     void recordDetailAnalysisFrame (double nowSeconds);
-    DetailAnalysisFrame calculateDetailAnalysisFrame (double nowSeconds) const;
+    DetailAnalysisFrame calculateDetailAnalysisFrame (double nowSeconds);
     void refreshDetailAnalysisButtonState();
     void drawDetailAnalysisPanel (juce::Graphics& g, juce::Rectangle<int> area);
     void drawAnalysisCurve (juce::Graphics& g,
@@ -96,6 +102,7 @@ private:
     std::array<float, kFftSize / 2>   latestSpectrum   { };
     std::array<float, kFftSize / 2>   latestResidual   { };
     std::array<float, kFftSize / 2>   previousAutoResidual { };
+    std::array<float, kFftSize / 2>   previousDetailSpectrum { };
     std::array<float, kNumNoisyPeaks> latestTopFreqs   { };
     std::array<float, kNumNoisyPeaks> latestTopMags    { };
 
@@ -116,9 +123,8 @@ private:
     juce::TextButton autoClearButton { "Clear" };
     juce::TextButton detailAnalysisButton { "Detail Analysis" };
     juce::Slider topPeakCountSlider;
-    juce::Slider autoSensitivitySlider;
-    juce::Slider autoMinGapSlider;
-    std::unique_ptr<juce::FileChooser> exportMidiChooser;
+    std::unique_ptr<AutoDetectionXYPad> autoDetectionPad;
+    std::unique_ptr<juce::FileChooser> exportFileChooser;
     std::unique_ptr<juce::LookAndFeel_V4> lookAndFeel;
 
     std::vector<FrozenChordSnapshot> frozenChords;
@@ -134,6 +140,7 @@ private:
     bool isAutoRunning = false;
     bool hasPreviousAutoResidual = false;
     bool hasPreviousAutoInputLevel = false;
+    bool hasPreviousDetailSpectrum = false;
     bool hasCompletedAutoAnalysis = false;
     int autoCaptureCount = 0;
     double autoStartWallTimeSeconds = 0.0;
