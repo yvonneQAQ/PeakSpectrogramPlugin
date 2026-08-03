@@ -26,13 +26,31 @@ project(SPEKANA VERSION 0.0.1)
 # add_subdirectory(JUCE)                    # If you've put JUCE in a subdirectory called JUCE
 set(JUCE_SOURCE_DIR "${JUCE_SOURCE_DIR}" CACHE PATH "Path to a local JUCE checkout")
 
-if(JUCE_SOURCE_DIR)
-    add_subdirectory("${JUCE_SOURCE_DIR}" ${CMAKE_BINARY_DIR}/JUCE)
-elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/JUCE/CMakeLists.txt")
-    add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/JUCE" ${CMAKE_BINARY_DIR}/JUCE)
+set(_juce_candidates
+    "${JUCE_SOURCE_DIR}"
+    "$ENV{JUCE_SOURCE_DIR}"
+    "$ENV{JUCE_DIR}"
+    "$ENV{JUCE_ROOT}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/JUCE"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../JUCE")
+
+set(_resolved_juce_source_dir "")
+foreach(_juce_candidate IN LISTS _juce_candidates)
+    if(_juce_candidate AND EXISTS "${_juce_candidate}/CMakeLists.txt")
+        set(_resolved_juce_source_dir "${_juce_candidate}")
+        break()
+    endif()
+endforeach()
+
+if(_resolved_juce_source_dir)
+    add_subdirectory("${_resolved_juce_source_dir}" "${CMAKE_BINARY_DIR}/JUCE")
 else()
-    message(FATAL_ERROR
-        "JUCE not found. Set -DJUCE_SOURCE_DIR=/path/to/JUCE or add JUCE to ./JUCE.")
+    find_package(JUCE CONFIG QUIET)
+
+    if(NOT JUCE_FOUND)
+        message(FATAL_ERROR
+            "JUCE not found. Set -DJUCE_SOURCE_DIR=/path/to/JUCE, add JUCE to ./JUCE, or install a JUCE package config.")
+    endif()
 endif()
 
 # If you are building a VST2 or AAX plugin, CMake needs to be told where to find these SDKs on your
@@ -58,6 +76,8 @@ juce_add_plugin(SPEKANA
     # IS_MIDI_EFFECT TRUE/FALSE                 # Is this plugin a MIDI effect?
     # EDITOR_WANTS_KEYBOARD_FOCUS TRUE/FALSE    # Does the editor need keyboard focus?
     # COPY_PLUGIN_AFTER_BUILD TRUE/FALSE        # Should the plugin be installed to a default location after building?
+    MICROPHONE_PERMISSION_ENABLED TRUE
+    MICROPHONE_PERMISSION_TEXT "SPEKANA needs audio input to analyse pitch and show the spectrogram."
     PLUGIN_MANUFACTURER_CODE Juce               # A four-character manufacturer id with at least one upper-case character
     PLUGIN_CODE Dem0                            # A unique four-character plugin id with exactly one upper-case character
                                                 # GarageBand 10.3 requires the first letter to be upper-case, and the remaining letters to be lower-case
@@ -119,7 +139,9 @@ target_compile_options(SPEKANA
 target_link_libraries(SPEKANA
     PRIVATE
         # AudioPluginData           # If we'd created a binary data target, we'd link to it here
-        juce::juce_dsp 
+        juce::juce_audio_devices
+        juce::juce_dsp
+        juce::juce_audio_utils
         juce::juce_audio_processors
     PUBLIC
         juce::juce_recommended_config_flags
