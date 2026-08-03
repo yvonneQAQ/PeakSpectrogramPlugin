@@ -19,8 +19,10 @@ One of its main intentions is to transform textured sound into usable MIDI mater
 - Quarter-tone notation using arrow accidentals in the score
 - `Freeze / Unfreeze / Reset` workflow for capturing chords over time
 - Embedded grand-staff score view
-- MIDI export from frozen chords
+- MIDI export from frozen chords and detailed descriptor analysis
+- Export time scaling at `*1`, `*2`, `*4`, `*5`, or `*10`
 - Live MIDI output from frozen chords
+- Included Max for Live bridge for mapping exported descriptors to Live parameters
 - Optional `Bass Boost` analysis mode
 
 ## Aesthetic Direction
@@ -95,6 +97,28 @@ Frozen chords can be sent out in two ways:
 - exported `.mid` files from the captured chord timeline
 
 Quarter-tone mode uses per-note pitch bend on separate channels where needed.
+
+Completed Auto analysis can also export a combined MIDI file containing notes and four descriptor streams:
+
+- CC20: spectral centroid
+- CC21: spectral flatness
+- CC22: roughness
+- CC23: stereo pan energy
+
+Before dragging or exporting combined MIDI, its complete timeline can be stretched to `*1`, `*2`, `*4`, `*5`, or `*10`. Notes, note lengths, pitch bends, and descriptor CC events remain aligned.
+
+## Max for Live Bridge
+
+The repository includes [spekana_bridge_v2.amxd](MaxForLive/spekana_bridge_v2.amxd), a Max MIDI Effect for routing SPEKANA's descriptor CC streams to Ableton Live parameters.
+
+To use it:
+
+1. Add the device to a MIDI track containing MIDI exported from SPEKANA.
+2. Choose a descriptor in each mapping chain.
+3. Press `Map`, then select a Live parameter.
+4. Adjust offset, depth, and the shared Rise/Fall smoothing controls as needed.
+
+The `.amxd` file can also be copied into Ableton's User Library under `Presets/MIDI Effects/Max MIDI Effect/`.
 
 ## UI Notes
 

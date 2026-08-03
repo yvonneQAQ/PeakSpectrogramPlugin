@@ -467,20 +467,32 @@ namespace
     }
 
     constexpr int kMidiTicksPerQuarter = 960;
+    constexpr double kMinMidiTimeScale = 1.0;
+    constexpr double kMaxMidiTimeScale = 10.0;
+
+    double sanitiseMidiTimeScale (double scale)
+    {
+        return juce::jlimit (kMinMidiTimeScale, kMaxMidiTimeScale, scale);
+    }
 
     void appendFrozenChordEvents (juce::MidiMessageSequence& eventTrack,
-                                  const std::vector<FrozenChordSnapshot>& snapshots)
+                                  const std::vector<FrozenChordSnapshot>& snapshots,
+                                  double timeScale)
     {
         constexpr int velocity = 96;
+        const double exportTimeScale = sanitiseMidiTimeScale (timeScale);
 
         for (int channel = 1; channel <= AudioPluginAudioProcessor::kNumNoisyPeaks; ++channel)
             appendPitchBendRangeSetup (eventTrack, channel, 0.0);
 
         for (size_t chordIndex = 0; chordIndex < snapshots.size(); ++chordIndex)
         {
-            const double startBeat = snapshots[chordIndex].startTimeSeconds;
+            // Scale every exported timestamp together so notes, pitch bends, and
+            // descriptor CCs stay aligned without changing the live analysis.
+            const double startBeat = snapshots[chordIndex].startTimeSeconds * exportTimeScale;
             const double endBeat = juce::jmax (snapshots[chordIndex].startTimeSeconds + 0.05,
-                                               snapshots[chordIndex].endTimeSeconds);
+                                               snapshots[chordIndex].endTimeSeconds)
+                                 * exportTimeScale;
 
             std::vector<QuantisedMidiNote> quantisedNotes;
             quantisedNotes.reserve (snapshots[chordIndex].freqsHz.size());
@@ -546,13 +558,15 @@ namespace
     }
 
     void appendDescriptorEvents (juce::MidiMessageSequence& eventTrack,
-                                 const std::vector<DetailAnalysisFrame>& frames)
+                                 const std::vector<DetailAnalysisFrame>& frames,
+                                 double timeScale)
     {
         constexpr int midiChannel = 1;
         constexpr int centroidCc = 20;
         constexpr int flatnessCc = 21;
         constexpr int roughnessCc = 22;
         constexpr int stereoPanCc = 23;
+        const double exportTimeScale = sanitiseMidiTimeScale (timeScale);
 
         int previousCentroid = -1;
         int previousFlatness = -1;
@@ -561,7 +575,9 @@ namespace
 
         for (const auto& frame : frames)
         {
-            const double tick = juce::jmax (0.0, frame.timeSeconds) * kMidiTicksPerQuarter;
+            const double tick = juce::jmax (0.0, frame.timeSeconds)
+                              * exportTimeScale
+                              * kMidiTicksPerQuarter;
             const int centroid = centroidToCc (frame.centroidHz);
             const int flatness = normalisedDescriptorToCc (frame.spectralFlatness);
             const int roughness = normalisedDescriptorToCc (frame.roughness);
@@ -616,26 +632,29 @@ namespace
         return midiFilePath;
     }
 
-    juce::File createMidiFileForSnapshots (const std::vector<FrozenChordSnapshot>& snapshots)
+    juce::File createMidiFileForSnapshots (const std::vector<FrozenChordSnapshot>& snapshots,
+                                           double timeScale)
     {
         juce::MidiMessageSequence eventTrack;
-        appendFrozenChordEvents (eventTrack, snapshots);
+        appendFrozenChordEvents (eventTrack, snapshots, timeScale);
         return writeMidiFile ("FrozenChords", eventTrack);
     }
 
-    juce::File createDescriptorMidiFile (const std::vector<DetailAnalysisFrame>& frames)
+    juce::File createDescriptorMidiFile (const std::vector<DetailAnalysisFrame>& frames,
+                                         double timeScale)
     {
         juce::MidiMessageSequence eventTrack;
-        appendDescriptorEvents (eventTrack, frames);
+        appendDescriptorEvents (eventTrack, frames, timeScale);
         return writeMidiFile ("SPEKANA_Descriptors", eventTrack);
     }
 
     juce::File createCombinedMidiFile (const std::vector<FrozenChordSnapshot>& snapshots,
-                                       const std::vector<DetailAnalysisFrame>& frames)
+                                       const std::vector<DetailAnalysisFrame>& frames,
+                                       double timeScale)
     {
         juce::MidiMessageSequence eventTrack;
-        appendFrozenChordEvents (eventTrack, snapshots);
-        appendDescriptorEvents (eventTrack, frames);
+        appendFrozenChordEvents (eventTrack, snapshots, timeScale);
+        appendDescriptorEvents (eventTrack, frames, timeScale);
         eventTrack.updateMatchedPairs();
         return writeMidiFile ("SPEKANA_Combined", eventTrack);
     }
@@ -648,6 +667,11 @@ public:
     {
         snapshots = std::move (newSnapshots);
         repaint();
+    }
+
+    void setMidiTimeScale (double newTimeScale)
+    {
+        midiTimeScale = sanitiseMidiTimeScale (newTimeScale);
     }
 
     void paint (juce::Graphics& g) override
@@ -683,7 +707,7 @@ public:
         if (event.getDistanceFromDragStart() < 6)
             return;
 
-        auto midiFile = createMidiFileForSnapshots (snapshots);
+        auto midiFile = createMidiFileForSnapshots (snapshots, midiTimeScale);
         if (! midiFile.existsAsFile())
             return;
 
@@ -711,6 +735,7 @@ private:
     juce::Rectangle<int> dragMidiBounds;
     bool dragCandidate = false;
     bool dragTriggered = false;
+    double midiTimeScale = 1.0;
 
     void drawContinuousSystem (juce::Graphics& g, juce::Rectangle<int> area) const
     {
@@ -945,6 +970,11 @@ public:
         setMouseCursor (juce::MouseCursor::DraggingHandCursor);
     }
 
+    void setMidiTimeScale (double newTimeScale)
+    {
+        midiTimeScale = sanitiseMidiTimeScale (newTimeScale);
+    }
+
     void paint (juce::Graphics& g) override
     {
         const auto bounds = getLocalBounds().toFloat();
@@ -969,8 +999,8 @@ public:
             return;
 
         const auto midiFile = snapshots.empty()
-                                ? createDescriptorMidiFile (frames)
-                                : createCombinedMidiFile (snapshots, frames);
+                                ? createDescriptorMidiFile (frames, midiTimeScale)
+                                : createCombinedMidiFile (snapshots, frames, midiTimeScale);
         if (! midiFile.existsAsFile())
             return;
 
@@ -983,6 +1013,86 @@ private:
     const std::vector<DetailAnalysisFrame>& frames;
     const std::vector<FrozenChordSnapshot>& snapshots;
     bool dragTriggered = false;
+    double midiTimeScale = 1.0;
+};
+
+class MidiTimeScaleSelector : public juce::Component
+{
+public:
+    MidiTimeScaleSelector()
+    {
+        setMouseCursor (juce::MouseCursor::PointingHandCursor);
+        setTitle ("MIDI Time Scale");
+        setDescription ("Choose how much to stretch the exported MIDI timeline");
+    }
+
+    double getTimeScale() const noexcept
+    {
+        return timeScales[(size_t) selectedIndex];
+    }
+
+    std::function<void(double)> onTimeScaleChanged;
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto bounds = getLocalBounds();
+        g.setColour (kPanelTint.withMultipliedAlpha (0.24f));
+        g.fillRoundedRectangle (bounds.toFloat(), 9.0f);
+
+        for (int index = 0; index < (int) timeScales.size(); ++index)
+        {
+            const auto segment = getSegmentBounds (index);
+
+            if (index == selectedIndex)
+            {
+                g.setColour (kButtonTerracottaStrong);
+                g.fillRoundedRectangle (segment.toFloat().reduced (1.0f), 8.0f);
+            }
+            else if (index > 0)
+            {
+                g.setColour (kTextPrimary.withAlpha (0.13f));
+                g.drawVerticalLine (segment.getX(), 5.0f, (float) getHeight() - 5.0f);
+            }
+
+            g.setColour (index == selectedIndex ? kButtonText : kSpectrogramLabel);
+            g.setFont (makeUIFont (8.0f, index == selectedIndex));
+            g.drawText ("*" + juce::String ((int) timeScales[(size_t) index]),
+                        segment,
+                        juce::Justification::centred);
+        }
+
+        g.setColour (kButtonTerracotta.withMultipliedAlpha (0.72f));
+        g.drawRoundedRectangle (bounds.toFloat().reduced (0.5f), 9.0f, 1.0f);
+    }
+
+    void mouseDown (const juce::MouseEvent& event) override
+    {
+        if (getWidth() <= 0)
+            return;
+
+        const int newIndex = juce::jlimit (0,
+                                           (int) timeScales.size() - 1,
+                                           event.x * (int) timeScales.size() / getWidth());
+        if (newIndex == selectedIndex)
+            return;
+
+        selectedIndex = newIndex;
+        repaint();
+
+        if (onTimeScaleChanged)
+            onTimeScaleChanged (getTimeScale());
+    }
+
+private:
+    juce::Rectangle<int> getSegmentBounds (int index) const
+    {
+        const int left = index * getWidth() / (int) timeScales.size();
+        const int right = (index + 1) * getWidth() / (int) timeScales.size();
+        return { left, 0, right - left, getHeight() };
+    }
+
+    static constexpr std::array<double, 5> timeScales { 1.0, 2.0, 4.0, 5.0, 10.0 };
+    int selectedIndex = 0;
 };
 
 namespace
@@ -1040,6 +1150,10 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
                                                                                   frozenChords);
     addAndMakeVisible (*descriptorMidiDragComponent);
     descriptorMidiDragComponent->setVisible (false);
+
+    midiTimeScaleSelector = std::make_unique<MidiTimeScaleSelector>();
+    addAndMakeVisible (*midiTimeScaleSelector);
+    midiTimeScaleSelector->setVisible (false);
 
     styleTextButton (freezeButton, true);
     styleTextButton (unfreezeButton);
@@ -1115,6 +1229,9 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
         if (descriptorMidiDragComponent != nullptr)
             descriptorMidiDragComponent->setVisible (isDetailPageActive);
 
+        if (midiTimeScaleSelector != nullptr)
+            midiTimeScaleSelector->setVisible (isDetailPageActive);
+
         repaint();
     };
 
@@ -1151,6 +1268,15 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     autoMinGapSlider.setColour (juce::Slider::backgroundColourId, kPanelTint.withMultipliedAlpha (0.35f));
     autoMinGapSlider.setColour (juce::Slider::textBoxTextColourId, kTextPrimary);
     autoMinGapSlider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+
+    midiTimeScaleSelector->onTimeScaleChanged = [this] (double timeScale)
+    {
+        if (staffComponent != nullptr)
+            staffComponent->setMidiTimeScale (timeScale);
+
+        if (descriptorMidiDragComponent != nullptr)
+            descriptorMidiDragComponent->setMidiTimeScale (timeScale);
+    };
 
     bassBoostButton.setClickingTogglesState (true);
     bassBoostButton.setToggleState (processorRef.getBassBoostMode(), juce::dontSendNotification);
@@ -1215,9 +1341,12 @@ unfreezeButton.onClick = [this]()
     {
         const bool includeDescriptors = hasCompletedAutoAnalysis
                                      && ! detailAnalysisHistory.empty();
+        const double timeScale = midiTimeScaleSelector != nullptr
+                                   ? midiTimeScaleSelector->getTimeScale()
+                                   : 1.0;
         auto midiFile = includeDescriptors
-                          ? createCombinedMidiFile (frozenChords, detailAnalysisHistory)
-                          : createMidiFileForSnapshots (frozenChords);
+                          ? createCombinedMidiFile (frozenChords, detailAnalysisHistory, timeScale)
+                          : createMidiFileForSnapshots (frozenChords, timeScale);
         if (! midiFile.existsAsFile())
             return;
 
@@ -1481,6 +1610,9 @@ void AudioPluginAudioProcessorEditor::refreshDetailAnalysisButtonState()
 
     if (descriptorMidiDragComponent != nullptr)
         descriptorMidiDragComponent->setVisible (isDetailPageActive && canOpenDetail);
+
+    if (midiTimeScaleSelector != nullptr)
+        midiTimeScaleSelector->setVisible (isDetailPageActive && canOpenDetail);
 }
 
 void AudioPluginAudioProcessorEditor::captureAutoChord (double nowSeconds)
@@ -1812,17 +1944,25 @@ void AudioPluginAudioProcessorEditor::drawDetailAnalysisPanel (juce::Graphics& g
     g.fillRoundedRectangle (panel.toFloat(), 16.0f);
 
     auto header = panel.reduced (14, 10).removeFromTop (24);
-    auto headerTextArea = header.withTrimmedRight (158);
+    header.removeFromRight (150); // Drag MIDI button
+    header.removeFromRight (10);
+    header.removeFromRight (180); // MIDI time-scale selector
+    header.removeFromRight (12);
+
+    auto titleArea = header.removeFromLeft (108);
+    header.removeFromLeft (6);
+    auto summaryArea = header;
+
     g.setColour (kSpectrogramLabel);
     g.setFont (makeUIFont (12.0f, true));
-    g.drawText ("Detail Analysis", headerTextArea, juce::Justification::centredLeft);
+    g.drawText ("Detail Analysis", titleArea, juce::Justification::centredLeft);
 
     g.setFont (makeUIFont (8.0f, false));
     const auto duration = detailAnalysisHistory.empty() ? 0.0 : detailAnalysisHistory.back().timeSeconds;
     g.drawText (juce::String (detailAnalysisHistory.size()) + " frames  |  "
                 + juce::String (duration, 1) + " sec",
-                headerTextArea,
-                juce::Justification::centredRight);
+                summaryArea,
+                juce::Justification::centredLeft);
 
     if (detailAnalysisHistory.empty())
     {
@@ -2187,16 +2327,25 @@ void AudioPluginAudioProcessorEditor::resized()
 
     if (descriptorMidiDragComponent != nullptr)
     {
-        auto detailPanel = scoreArea.reduced (10, 8);
-        descriptorMidiDragComponent->setBounds (detailPanel.getRight() - 150,
-                                                detailPanel.getY() + 8,
-                                                150,
-                                                22);
-        descriptorMidiDragComponent->setVisible (isDetailPageActive
-                                                  && hasCompletedAutoAnalysis
-                                                  && ! detailAnalysisHistory.empty()
-                                                  && ! isAutoRunning);
+        auto detailHeader = scoreArea.reduced (10, 8).reduced (14, 10).removeFromTop (24);
+        const auto dragMidiBounds = detailHeader.removeFromRight (150);
+        detailHeader.removeFromRight (10);
+        const auto timeScaleBounds = detailHeader.removeFromRight (180);
+        const bool showDetailControls = isDetailPageActive
+                                     && hasCompletedAutoAnalysis
+                                     && ! detailAnalysisHistory.empty()
+                                     && ! isAutoRunning;
+
+        descriptorMidiDragComponent->setBounds (dragMidiBounds);
+        descriptorMidiDragComponent->setVisible (showDetailControls);
         descriptorMidiDragComponent->toFront (false);
+
+        if (midiTimeScaleSelector != nullptr)
+        {
+            midiTimeScaleSelector->setBounds (timeScaleBounds);
+            midiTimeScaleSelector->setVisible (showDetailControls);
+            midiTimeScaleSelector->toFront (false);
+        }
     }
 
     rightPanel.removeFromTop (44);

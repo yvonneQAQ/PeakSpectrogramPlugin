@@ -10,6 +10,7 @@
 class AudioPluginAudioProcessor;
 class FrozenChordStaffComponent;
 class DescriptorMidiDragComponent;
+class MidiTimeScaleSelector;
 
 struct FrozenChordSnapshot
 {
@@ -123,6 +124,7 @@ private:
     std::vector<FrozenChordSnapshot> frozenChords;
     std::unique_ptr<FrozenChordStaffComponent> staffComponent;
     std::unique_ptr<DescriptorMidiDragComponent> descriptorMidiDragComponent;
+    std::unique_ptr<MidiTimeScaleSelector> midiTimeScaleSelector;
     int freezeCaptureCount = 0;
     double activeFreezeSessionStartWallTimeSeconds = 0.0;
     double activeFreezeSessionOffsetSeconds = 0.0;
