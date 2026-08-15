@@ -94,6 +94,7 @@ float smoothingCoeff = 0.9f;
 // Top 10 result
 std::array<float, kNumNoisyPeaks> topFrequenciesHz {};
 std::array<float, kNumNoisyPeaks> topResidualsDb {};
+std::array<float, kNumNoisyPeaks> topPeakLevelsDbFs {};
 mutable juce::SpinLock fftLock;
 
     // ⭐⭐⭐ 现在新增的平滑相关成员 ⭐⭐⭐
@@ -106,14 +107,20 @@ double currentSampleRate = 44100.0;
 void getSpectrumCopy (std::array<float, kFftSize / 2>& dest) const;
 // Copies the full residual spectrum for the editor's spectral-flux onset detector.
 void getResidualCopy (std::array<float, kFftSize / 2>& dest) const;
-void getTopPeaksCopy (std::array<float, kNumNoisyPeaks>& freqs, std::array<float, kNumNoisyPeaks>& mags) const;
-void setLiveFrozenMidiChord (const std::array<float, kNumNoisyPeaks>& freqsHz, bool useQuarterToneMode);
+void getTopPeaksCopy (std::array<float, kNumNoisyPeaks>& freqs,
+                      std::array<float, kNumNoisyPeaks>& residualsDb,
+                      std::array<float, kNumNoisyPeaks>& peakLevelsDbFs) const;
+void setLiveFrozenMidiChord (const std::array<float, kNumNoisyPeaks>& freqsHz,
+                            const std::array<float, kNumNoisyPeaks>& partialIntensities,
+                            bool useQuarterToneMode);
 void clearLiveFrozenMidiChord();
 void setBassBoostMode (bool shouldUseBassBoost);
 bool getBassBoostMode() const;
 float getInputLevelDb() const;
 bool getStereoPanAvailable() const;
 float getStereoPanEnergy() const;
+bool hasHostTransportState() const;
+bool getHostTransportPlaying() const;
 
 // 小工具函数
 void pushSample (float s);
@@ -126,6 +133,7 @@ void updateEnvelopeAndNoisyPeaks();
         int channel = 1;
         int midiNote = -1;
         int pitchWheelValue = 8192;
+        juce::uint8 velocity = 96;
     };
 
 private:
@@ -139,6 +147,8 @@ private:
     std::atomic<float> inputLevelDb { -120.0f };
     std::atomic<bool> stereoPanAvailable { false };
     std::atomic<float> stereoPanEnergy { 0.0f };
+    std::atomic<bool> hostTransportStateAvailable { false };
+    std::atomic<bool> hostTransportPlaying { false };
 
     //==============================================================================
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioPluginAudioProcessor)

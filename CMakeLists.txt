@@ -110,7 +110,10 @@ target_compile_options(SPEKANA
 # static library. These source files can be of any kind (wav data, images, fonts, icons etc.).
 # Conversion to binary-data will happen when your target is built.
 
-# juce_add_binary_data(AudioPluginData SOURCES ...)
+juce_add_binary_data(SPEKANAAssets
+    NAMESPACE SPEKANAAssets
+    SOURCES
+        Assets/forest_background.jpeg)
 
 # `target_link_libraries` links libraries and JUCE modules to other libraries or executables. Here,
 # we're linking our executable target to the `juce::juce_audio_utils` module. Inter-module
@@ -120,7 +123,7 @@ target_compile_options(SPEKANA
 
 target_link_libraries(SPEKANA
     PRIVATE
-        # AudioPluginData           # If we'd created a binary data target, we'd link to it here
+        SPEKANAAssets
         juce::juce_audio_devices
         juce::juce_dsp
         juce::juce_audio_utils

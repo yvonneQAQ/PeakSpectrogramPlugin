@@ -10,7 +10,7 @@ namespace
     constexpr int kPitchBendCentre = 8192;
     constexpr int kPitchBendMax = 16383;
     constexpr int kPitchBendRangeSemitones = 1;
-    constexpr int kMidiVelocity = 96;
+    constexpr int kMinimumPartialVelocity = 1;
 
     struct QuantisedMidiPitch
     {
@@ -77,16 +77,12 @@ namespace
         return { true, midiNote, kPitchBendCentre };
     }
 
-    bool containsLiveMidiNote (const std::vector<AudioPluginAudioProcessor::LiveMidiNote>& notes,
-                               int midiNote,
-                               int pitchWheelValue)
+    juce::uint8 midiVelocityForPartialIntensity (float intensity)
     {
-        return std::any_of (notes.begin(), notes.end(),
-                            [midiNote, pitchWheelValue] (const auto& note)
-                            {
-                                return note.midiNote == midiNote
-                                    && note.pitchWheelValue == pitchWheelValue;
-                            });
+        const float linearIntensity = juce::jlimit (0.0f, 1.0f, intensity);
+        return (juce::uint8) std::round (juce::jmap (linearIntensity,
+                                                     (float) kMinimumPartialVelocity,
+                                                     127.0f));
     }
 
     void appendPitchBendRangeSetup (juce::MidiBuffer& midiMessages, int channel, int sampleOffset)
@@ -198,7 +194,8 @@ void AudioPluginAudioProcessor::getResidualCopy (std::array<float, kFftSize / 2>
 }
 
 void AudioPluginAudioProcessor::getTopPeaksCopy (std::array<float, kNumNoisyPeaks>& freqsHz,
-                                                 std::array<float, kNumNoisyPeaks>& residualDbOut) const
+                                                 std::array<float, kNumNoisyPeaks>& residualDbOut,
+                                                 std::array<float, kNumNoisyPeaks>& peakLevelsDbFsOut) const
 {
     const juce::SpinLock::ScopedLockType lock (peakLock);   // ⭐ 用跟 runFftAndFindPeaks 一样的锁
 
@@ -206,30 +203,46 @@ void AudioPluginAudioProcessor::getTopPeaksCopy (std::array<float, kNumNoisyPeak
     {
         freqsHz[(size_t) i]       = topFrequenciesHz[(size_t) i];   // runFftAndFindPeaks 填的 noisy peaks 频率
         residualDbOut[(size_t) i] = topResidualsDb[(size_t) i];     // Raw dB above the envelope.
+        peakLevelsDbFsOut[(size_t) i] = topPeakLevelsDbFs[(size_t) i];
     }
 }
 
-void AudioPluginAudioProcessor::setLiveFrozenMidiChord (const std::array<float, kNumNoisyPeaks>& freqsHz,
-                                                        bool useQuarterToneMode)
+void AudioPluginAudioProcessor::setLiveFrozenMidiChord (
+    const std::array<float, kNumNoisyPeaks>& freqsHz,
+    const std::array<float, kNumNoisyPeaks>& partialIntensities,
+    bool useQuarterToneMode)
 {
     std::vector<LiveMidiNote> nextNotes;
     nextNotes.reserve (kNumNoisyPeaks);
 
     int nextQuarterToneChannel = 1;
 
-    for (float freqHz : freqsHz)
+    for (size_t peakIndex = 0; peakIndex < freqsHz.size(); ++peakIndex)
     {
+        const float freqHz = freqsHz[peakIndex];
         const auto pitch = quantiseFrequencyToMidiPitch (freqHz, useQuarterToneMode);
         if (! pitch.valid)
             continue;
 
-        if (containsLiveMidiNote (nextNotes, pitch.midiNote, pitch.pitchWheelValue))
+        const auto duplicate = std::find_if (nextNotes.begin(), nextNotes.end(),
+                                             [&pitch] (const auto& note)
+                                             {
+                                                 return note.midiNote == pitch.midiNote
+                                                     && note.pitchWheelValue == pitch.pitchWheelValue;
+                                             });
+        const auto velocity = midiVelocityForPartialIntensity (partialIntensities[peakIndex]);
+
+        if (duplicate != nextNotes.end())
+        {
+            duplicate->velocity = juce::jmax (duplicate->velocity, velocity);
             continue;
+        }
 
         LiveMidiNote liveNote;
         liveNote.channel = useQuarterToneMode ? nextQuarterToneChannel++ : 1;
         liveNote.midiNote = pitch.midiNote;
         liveNote.pitchWheelValue = pitch.pitchWheelValue;
+        liveNote.velocity = velocity;
         nextNotes.push_back (liveNote);
 
         if (useQuarterToneMode && nextQuarterToneChannel > 16)
@@ -273,6 +286,16 @@ float AudioPluginAudioProcessor::getStereoPanEnergy() const
     return stereoPanEnergy.load();
 }
 
+bool AudioPluginAudioProcessor::hasHostTransportState() const
+{
+    return hostTransportStateAvailable.load (std::memory_order_relaxed);
+}
+
+bool AudioPluginAudioProcessor::getHostTransportPlaying() const
+{
+    return hostTransportPlaying.load (std::memory_order_relaxed);
+}
+
 void AudioPluginAudioProcessor::applyPendingMidiOutputChanges (juce::MidiBuffer& midiMessages)
 {
     std::vector<LiveMidiNote> nextNotes;
@@ -303,7 +326,7 @@ void AudioPluginAudioProcessor::applyPendingMidiOutputChanges (juce::MidiBuffer&
         midiMessages.addEvent (juce::MidiMessage::pitchWheel (note.channel, note.pitchWheelValue), sampleOffset);
         midiMessages.addEvent (juce::MidiMessage::noteOn (note.channel,
                                                           note.midiNote,
-                                                          (juce::uint8) kMidiVelocity),
+                                                          note.velocity),
                                sampleOffset);
     }
 }
@@ -346,13 +369,30 @@ void AudioPluginAudioProcessor::updateEnvelopeAndNoisyPeaks()
             bandEnv[b] = -100.0f;     // 很小的 dB
     }
 
-    // 把 bandEnv 拉回每个 bin 上（简单做：同一 band 内用同一个值）
+    // Interpolate between neighbouring band centres instead of assigning one
+    // constant value to every bin in a band. A stepped envelope can create an
+    // artificial residual maximum exactly at a band boundary.
     for (int bin = 0; bin < numBins; ++bin)
     {
-        int bandIdx = (bin * kNumEnvBands) / numBins;
-        bandIdx = juce::jlimit (0, kNumEnvBands - 1, bandIdx);
+        const float bandPosition = ((float) bin + 0.5f) * (float) kNumEnvBands
+                                     / (float) numBins - 0.5f;
+        const int leftBand = (int) std::floor (bandPosition);
 
-        envelopeDb[(size_t) bin] = bandEnv[bandIdx];
+        if (leftBand < 0)
+        {
+            envelopeDb[(size_t) bin] = bandEnv[0];
+        }
+        else if (leftBand >= kNumEnvBands - 1)
+        {
+            envelopeDb[(size_t) bin] = bandEnv[(size_t) kNumEnvBands - 1];
+        }
+        else
+        {
+            const float fraction = bandPosition - (float) leftBand;
+            envelopeDb[(size_t) bin] = bandEnv[(size_t) leftBand]
+                                      + fraction * (bandEnv[(size_t) leftBand + 1]
+                                                    - bandEnv[(size_t) leftBand]);
+        }
     }
 
     // ===============================
@@ -434,6 +474,7 @@ void AudioPluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPer
     magnitudeSpectrum.fill (0.0f);
     topFrequenciesHz.fill (0.0f);
     topResidualsDb.fill (0.0f);
+    topPeakLevelsDbFs.fill (-120.0f);
     smoothedMagnitudes.fill (0.0f);
     smoothedMagnitudesDb.fill (0.0f);
     pendingLiveMidiNotes.clear();
@@ -503,6 +544,23 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 {
     juce::ScopedNoDenormals noDenormals;
     applyPendingMidiOutputChanges (midiMessages);
+
+    // Cache the DAW transport state on the audio thread. The editor uses this
+    // snapshot to stop an active analysis as soon as the host transport stops,
+    // without querying AudioPlayHead directly from the message thread.
+    bool transportStateAvailable = false;
+    bool transportIsPlaying = false;
+    if (auto* playHead = getPlayHead())
+    {
+        if (const auto position = playHead->getPosition())
+        {
+            transportStateAvailable = true;
+            transportIsPlaying = position->getIsPlaying();
+        }
+    }
+
+    hostTransportPlaying.store (transportIsPlaying, std::memory_order_relaxed);
+    hostTransportStateAvailable.store (transportStateAvailable, std::memory_order_relaxed);
 
     auto totalNumInputChannels  = getTotalNumInputChannels();
     auto totalNumOutputChannels = getTotalNumOutputChannels();
@@ -592,6 +650,9 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
     std::array<float, kFftSize / 2> currentSpectrumDb {};
     std::array<float, kFftSize / 2> currentEnvelopeDb {};
     std::array<float, kFftSize / 2> currentResidualDb {};
+    const float fftMagnitudeToDbfs = juce::Decibels::gainToDecibels (
+        2.0f / (float) kFftSize,
+        -120.0f);
 
     // 2. 时间平滑：smoothedMagnitudes = 0.9 * old + 0.1 * new
     for (int bin = 0; bin < numBins; ++bin)
@@ -647,13 +708,30 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
             bandEnv[(size_t) b] = -120.0f;
     }
 
-    // 把 bandEnv 拉回每个 bin（同 band 内用同一个 dB）
+    // Linearly interpolate the band averages at their centres. This keeps the
+    // whitening envelope continuous and prevents a quiet neighbouring band
+    // from creating a false residual peak at the shared boundary.
     for (int bin = 0; bin < numBins; ++bin)
     {
-        int bandIdx = (bin * kNumEnvBands) / numBins;
-        bandIdx = std::clamp (bandIdx, 0, kNumEnvBands - 1);
+        const float bandPosition = ((float) bin + 0.5f) * (float) kNumEnvBands
+                                     / (float) numBins - 0.5f;
+        const int leftBand = (int) std::floor (bandPosition);
 
-        currentEnvelopeDb[(size_t) bin] = bandEnv[(size_t) bandIdx];
+        if (leftBand < 0)
+        {
+            currentEnvelopeDb[(size_t) bin] = bandEnv[0];
+        }
+        else if (leftBand >= kNumEnvBands - 1)
+        {
+            currentEnvelopeDb[(size_t) bin] = bandEnv[(size_t) kNumEnvBands - 1];
+        }
+        else
+        {
+            const float fraction = bandPosition - (float) leftBand;
+            currentEnvelopeDb[(size_t) bin] = bandEnv[(size_t) leftBand]
+                                             + fraction * (bandEnv[(size_t) leftBand + 1]
+                                                           - bandEnv[(size_t) leftBand]);
+        }
     }
 
     // ==========================================================
@@ -726,10 +804,45 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
     const float minHz = useBassBoost ? 28.0f : 40.0f;
     const float maxHz = 4000.0f;
 
+    // Treat the user-selected peak count as a maximum rather than a quota.
+    // A local residual can be large even when the underlying magnitude is
+    // only numerical noise or a Hann-window sidelobe. Requiring candidates to
+    // remain within 30 dB of the strongest in-range component prevents those
+    // very weak local maxima from being selected merely to fill every slot.
+    constexpr float kPeakCandidateDynamicRangeDb = 30.0f;
+    float strongestCandidateMagnitudeDb = -120.0f;
+
+    for (int bin = 1; bin < numBins - 1; ++bin)
+    {
+        const float hz = (float) bin * (float) currentSampleRate / (float) kFftSize;
+        if (hz >= minHz && hz <= maxHz)
+            strongestCandidateMagnitudeDb = juce::jmax (strongestCandidateMagnitudeDb,
+                                                        currentSpectrumDb[(size_t) bin]);
+    }
+
+    const float candidateMagnitudeFloorDb = juce::jmax (-120.0f,
+                                                         strongestCandidateMagnitudeDb
+                                                           - kPeakCandidateDynamicRangeDb);
+
+    // The ordinary peak path remains deliberately selective, but a piano or
+    // other bass-rich source can have a real fundamental far below a strong
+    // upper partial. Harmonic support supplies the extra evidence needed to
+    // admit a wider dynamic range without weakening the default detector.
+    constexpr float kBassCandidateDynamicRangeDb = 60.0f;
+    const float bassCandidateMagnitudeFloorDb = juce::jmax (-120.0f,
+                                                             strongestCandidateMagnitudeDb
+                                                               - kBassCandidateDynamicRangeDb);
+
+    Peak bestSupportedBassFundamental;
+    bool hasSupportedBassFundamental = false;
+
     for (int bin = 1; bin < numBins - 1; ++bin)
     {
         const float hz = (float) bin * (float) currentSampleRate / (float) kFftSize;
         if (hz < minHz || hz > maxHz)
+            continue;
+
+        if (currentSpectrumDb[(size_t) bin] <= candidateMagnitudeFloorDb)
             continue;
 
         const float residual = currentResidualDb[(size_t) bin];
@@ -788,6 +901,9 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
             const float fundamentalHz = (float) bin * (float) currentSampleRate / (float) kFftSize;
             const float fundamentalResidual = currentResidualDb[(size_t) bin];
 
+            if (currentSpectrumDb[(size_t) bin] <= bassCandidateMagnitudeFloorDb)
+                continue;
+
             if (fundamentalResidual < kMinFundamentalResidualDb)
                 continue;
 
@@ -820,9 +936,17 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
             const float bassBonus = juce::jmax (0.0f, salience - fundamentalResidual)
                                   * kBassHarmonicBonusWeight;
 
-            candidates.push_back ({ originalScore + bassBonus,
-                                    fundamentalResidual,
-                                    bin });
+            const Peak bassCandidate { originalScore + bassBonus,
+                                       fundamentalResidual,
+                                       bin };
+            candidates.push_back (bassCandidate);
+
+            if (! hasSupportedBassFundamental
+                || bassCandidate.score > bestSupportedBassFundamental.score)
+            {
+                bestSupportedBassFundamental = bassCandidate;
+                hasSupportedBassFundamental = true;
+            }
         }
     }
 
@@ -833,6 +957,7 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
         {
             topFrequenciesHz[(size_t) k] = 0.0f;
             topResidualsDb[(size_t) k]   = 0.0f;
+            topPeakLevelsDbFs[(size_t) k] = -120.0f;
         }
         return;
     }
@@ -845,10 +970,26 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
 
     std::array<float, kNumNoisyPeaks> selectedFreqs {};
     std::array<float, kNumNoisyPeaks> selectedResidualsDb {};
+    std::array<float, kNumNoisyPeaks> selectedPeakLevelsDbFs {};
     selectedFreqs.fill (0.0f);
     selectedResidualsDb.fill (0.0f);
+    selectedPeakLevelsDbFs.fill (-120.0f);
 
     int selectedCount = 0;
+
+    // Bass Boost guarantees one output position for the strongest candidate
+    // that passed the fundamental-plus-harmonic test. In particular, this
+    // keeps a weak piano fundamental from being displaced by ten louder upper
+    // partials. The normal sorted pass below fills all remaining positions and
+    // automatically skips the duplicate through its spacing check.
+    if (useBassBoost && hasSupportedBassFundamental)
+    {
+        selectedFreqs[0] = refinedFrequencyForBin (bestSupportedBassFundamental.binIndex);
+        selectedResidualsDb[0] = bestSupportedBassFundamental.residualDb;
+        selectedPeakLevelsDbFs[0] = currentSpectrumDb[(size_t) bestSupportedBassFundamental.binIndex]
+                                  + fftMagnitudeToDbfs;
+        selectedCount = 1;
+    }
 
     for (const auto& candidate : candidates)
     {
@@ -872,9 +1013,12 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
             continue;
 
         selectedFreqs[(size_t) selectedCount] = hz;
-        // Ranking may use bass weights and harmonic bonuses, but consumers
-        // receive the unmodified residual dB value.
+        // Ranking may use bass weights and harmonic bonuses. Publish both the
+        // unmodified residual and the selected bin's absolute dBFS level so
+        // musical intensity never depends on the ranking score.
         selectedResidualsDb[(size_t) selectedCount] = candidate.residualDb;
+        selectedPeakLevelsDbFs[(size_t) selectedCount] = currentSpectrumDb[(size_t) candidate.binIndex]
+                                                        + fftMagnitudeToDbfs;
         ++selectedCount;
     }
 
@@ -887,11 +1031,13 @@ void AudioPluginAudioProcessor::runFftAndFindPeaks()
             {
                 topFrequenciesHz[(size_t) k] = selectedFreqs[(size_t) k];
                 topResidualsDb[(size_t) k]   = selectedResidualsDb[(size_t) k];
+                topPeakLevelsDbFs[(size_t) k] = selectedPeakLevelsDbFs[(size_t) k];
             }
             else
             {
                 topFrequenciesHz[(size_t) k] = 0.0f;
                 topResidualsDb[(size_t) k]   = 0.0f;
+                topPeakLevelsDbFs[(size_t) k] = -120.0f;
             }
         }
     }

@@ -1,7 +1,9 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include <BinaryData.h>
 
 
+#include <algorithm>
 #include <cmath> // 为了 std::log2, std::round
 #include <cstring>
 #include <limits>
@@ -15,33 +17,218 @@ namespace
     constexpr int kMaxAutoChordsSafety = 128;
     constexpr int kMaxDetailAnalysisFrames = 2400;
     constexpr double kMaxAutoDurationSeconds = 30.0;
+    constexpr double kAutoMinimumGapMs = 100.0;
+    constexpr float kPeakIntensityFloorDbFs = -72.0f;
+    constexpr float kPeakIntensityCeilingDbFs = -6.0f;
+    constexpr int kMinimumPartialVelocity = 1;
+    constexpr float kButtonBackgroundAlpha = 0.75f;
+    constexpr float kModuleScale = 0.85f;
+    constexpr int kLeftColumnShift = 24;
+    constexpr int kRightColumnShift = 0;
+    constexpr int kEditorWidth = 1032;
+    constexpr int kEditorHeight = 624;
+    constexpr int kOuterMargin = 12;
+    constexpr int kRightPanelWidth = 222;
+    constexpr int kMainColumnGap = 9;
+    constexpr int kSpectrogramTopOffset = 37;
+    constexpr int kSpectrogramBottomGap = 9;
+    constexpr int kTitleAreaHeight = 44;
+    constexpr int kRightPanelInset = 12;
+    constexpr int kBottomInfoHeight = 25;
+    constexpr int kPeakTextAreaHeight = 132;
+    constexpr int kDetailHeaderHeight = 25;
+    constexpr int kDetailDragWidth = 155;
+    constexpr int kDetailTimeScaleWidth = 185;
+    constexpr float kUnifiedCornerRadius = 12.0f;
 
-    const juce::Colour kEditorBackground = juce::Colour::fromRGB (156, 167, 127);
-    const juce::Colour kPanelBackground = juce::Colour::fromRGB (41, 56, 49);
-    const juce::Colour kPanelOutline = juce::Colour::fromRGB (110, 125, 93);
-    const juce::Colour kPanelTint = juce::Colour::fromRGB (170, 180, 141);
-    const juce::Colour kTextPrimary = juce::Colour::fromRGB (24, 28, 20);
-    const juce::Colour kTextSecondary = juce::Colour::fromRGB (55, 66, 46);
-    const juce::Colour kButtonTerracotta = juce::Colour::fromRGB (178, 97, 76);
-    const juce::Colour kButtonTerracottaStrong = juce::Colour::fromRGB (156, 78, 59);
-    const juce::Colour kButtonTerracottaMuted = juce::Colour::fromRGB (193, 126, 108);
-    const juce::Colour kButtonText = juce::Colour::fromRGB (248, 241, 234);
-    const juce::Colour kSpectrogramBase = juce::Colour::fromRGB (20, 34, 30);
-    const juce::Colour kSpectrogramLine = juce::Colour::fromRGB (238, 243, 233).withAlpha (0.26f);
-    const juce::Colour kSpectrogramLabel = juce::Colour::fromRGB (245, 247, 241).withAlpha (0.94f);
+    using PartialIntensityArray =
+        std::array<float, AudioPluginAudioProcessor::kNumNoisyPeaks>;
+
+    PartialIntensityArray calculatePartialIntensities (
+        const std::array<float, AudioPluginAudioProcessor::kNumNoisyPeaks>& freqsHz,
+        const std::array<float, AudioPluginAudioProcessor::kNumNoisyPeaks>& peakLevelsDbFs,
+        int activePeakCount)
+    {
+        PartialIntensityArray intensities {};
+        const int peakCount = juce::jlimit (0,
+                                            AudioPluginAudioProcessor::kNumNoisyPeaks,
+                                            activePeakCount);
+
+        for (int peakIndex = 0; peakIndex < peakCount; ++peakIndex)
+        {
+            if (freqsHz[(size_t) peakIndex] <= 0.0f)
+                continue;
+
+            const float levelDbFs = peakLevelsDbFs[(size_t) peakIndex];
+            if (! std::isfinite (levelDbFs))
+                continue;
+
+            const float clampedDbFs = juce::jlimit (kPeakIntensityFloorDbFs,
+                                                     kPeakIntensityCeilingDbFs,
+                                                     levelDbFs);
+            intensities[(size_t) peakIndex] = juce::jmap (clampedDbFs,
+                                                           kPeakIntensityFloorDbFs,
+                                                           kPeakIntensityCeilingDbFs,
+                                                           0.0f,
+                                                           1.0f);
+        }
+
+        return intensities;
+    }
+
+    juce::Path makeOrganicCapsulePath (juce::Rectangle<float> bounds, float expression)
+    {
+        expression = juce::jlimit (0.0f, 1.0f, expression);
+
+        const float x = bounds.getX();
+        const float y = bounds.getY();
+        const float w = bounds.getWidth();
+        const float h = bounds.getHeight();
+        const auto px = [x, w] (float proportion) { return x + w * proportion; };
+        const auto py = [y, h] (float proportion) { return y + h * proportion; };
+
+        const float topLeft = 0.075f + 0.018f * expression;
+        const float topMiddle = 0.050f - 0.024f * expression;
+        const float topRight = 0.080f + 0.035f * expression;
+        const float rightMiddle = 0.988f + 0.008f * expression;
+        const float bottomRight = 0.915f - 0.018f * expression;
+        const float bottomMiddle = 0.950f + 0.030f * expression;
+        const float bottomLeft = 0.920f + 0.020f * expression;
+        const float leftMiddle = 0.012f - 0.006f * expression;
+
+        juce::Path path;
+        path.startNewSubPath (px (leftMiddle), py (0.50f + 0.018f * expression));
+        path.cubicTo (px (-0.005f), py (0.25f),
+                      px (0.065f), py (topLeft),
+                      px (0.215f), py (topLeft));
+        path.cubicTo (px (0.390f), py (topMiddle),
+                      px (0.610f), py (0.070f + 0.018f * expression),
+                      px (0.790f), py (topRight));
+        path.cubicTo (px (0.935f), py (topRight + 0.005f),
+                      px (rightMiddle), py (0.285f),
+                      px (rightMiddle), py (0.490f - 0.012f * expression));
+        path.cubicTo (px (1.000f), py (0.740f),
+                      px (0.915f), py (bottomRight),
+                      px (0.755f), py (bottomRight));
+        path.cubicTo (px (0.565f), py (bottomMiddle),
+                      px (0.365f), py (0.900f + 0.020f * expression),
+                      px (0.205f), py (bottomLeft));
+        path.cubicTo (px (0.065f), py (bottomLeft),
+                      px (leftMiddle), py (0.760f),
+                      px (leftMiddle), py (0.50f + 0.018f * expression));
+        path.closeSubPath();
+        return path;
+    }
+
+    // Photograph theme: translucent neutral panels preserve the image while
+    // white typography and a warm spectral accent maintain legibility.
+    const juce::Colour kEditorBackground = juce::Colour::fromRGB (39, 33, 33);     // #272121 fallback
+    const juce::Colour kPanelBackground = juce::Colour::fromRGB (225, 225, 225);
+    const juce::Colour kPanelTint = juce::Colour::fromRGB (238, 238, 238);
+    const juce::Colour kTextPrimary = juce::Colour::fromRGB (23, 19, 19);          // #171313
+    const juce::Colour kTextSecondary = juce::Colour::fromRGB (74, 70, 68);        // deep grey
+    const juce::Colour kButtonTerracotta = juce::Colour::fromRGB (210, 210, 210);
+    const juce::Colour kButtonTerracottaStrong = juce::Colour::fromRGB (78, 78, 78);
+    const juce::Colour kButtonTerracottaMuted = juce::Colour::fromRGB (227, 137, 41); // #E38929
+    const juce::Colour kAmberText = juce::Colour::fromRGB (245, 192, 91); // #F5C05B
+    const juce::Colour kContrastBlush = kTextPrimary;
+    const juce::Colour kButtonText = kTextPrimary;
+    const juce::Colour kLargePanelColour = juce::Colour::fromRGB (238, 233, 223).withAlpha (0.42f);
+    const juce::Colour kPanelUnderlayColour = juce::Colour::fromRGB (235, 230, 220).withAlpha (0.14f);
+    const juce::Colour kSidebarPanelColour = juce::Colour::fromRGB (242, 238, 230).withAlpha (0.46f);
+    const juce::Colour kSidebarUnderlayColour = juce::Colour::fromRGB (236, 231, 220).withAlpha (0.16f);
+    const juce::Colour kBackgroundVeil = juce::Colour::fromRGB (210, 205, 190).withAlpha (0.10f);
+    const juce::Colour kSpectrogramCanvasBackground = juce::Colour::fromRGB (217, 216, 203).withAlpha (0.96f);
+    const juce::Colour kSpectrogramLine = juce::Colour::fromRGB (92, 94, 86).withAlpha (0.11f);
+    const juce::Colour kSpectrogramStaticLabel = juce::Colour::fromRGB (91, 89, 84).withAlpha (0.78f);
+    const juce::Colour kSpectrogramLabel = kButtonTerracottaMuted;
+    const juce::Colour kFreezeMarker = juce::Colour::fromRGB (137, 166, 124);      // #89A67C
+    const juce::Colour kDetailDivider = juce::Colours::black.withAlpha (0.10f);
 
     juce::Colour spectrogramColourForLevel (float norm)
     {
         norm = juce::jlimit (0.0f, 1.0f, norm);
+        norm = std::pow (norm, 1.35f);
 
-        const auto low = juce::Colour::fromRGB (30, 48, 41);
-        const auto mid = juce::Colour::fromRGB (72, 116, 103);
-        const auto high = juce::Colour::fromRGB (220, 210, 172);
+        // Keep quiet bins close to the canvas, then travel through several
+        // distinct hues before reaching orange. This makes small level
+        // differences readable instead of turning a broadband frame into one
+        // nearly uniform warm block.
+        const auto quiet = kSpectrogramCanvasBackground.withAlpha (1.0f);
+        const auto low = juce::Colour::fromRGB (174, 184, 164);   // muted sage
+        const auto mid = juce::Colour::fromRGB (204, 193, 151);   // olive sand
+        const auto high = juce::Colour::fromRGB (230, 168, 64);   // amber
+        const auto peak = juce::Colour::fromRGB (218, 91, 43);    // terracotta
 
-        if (norm < 0.55f)
-            return low.interpolatedWith (mid, norm / 0.55f);
+        if (norm < 0.18f)
+            return quiet.interpolatedWith (low, norm / 0.18f);
 
-        return mid.interpolatedWith (high, (norm - 0.55f) / 0.45f);
+        if (norm < 0.36f)
+            return low.interpolatedWith (mid, (norm - 0.18f) / 0.18f);
+
+        if (norm < 0.76f)
+            return mid.interpolatedWith (high, (norm - 0.36f) / 0.40f);
+
+        return high.interpolatedWith (peak, (norm - 0.76f) / 0.24f);
+    }
+
+    const juce::Image& getEditorBackgroundImage()
+    {
+        static const auto image = []
+        {
+            return juce::ImageFileFormat::loadFrom (
+                SPEKANAAssets::forest_background_jpeg,
+                SPEKANAAssets::forest_background_jpegSize);
+        }();
+        return image;
+    }
+
+    void drawImageCover (juce::Graphics& g, const juce::Image& image, juce::Rectangle<float> destination)
+    {
+        if (! image.isValid() || destination.isEmpty())
+            return;
+
+        auto source = image.getBounds().toFloat();
+        const float destinationAspect = destination.getWidth() / destination.getHeight();
+        const float sourceAspect = source.getWidth() / source.getHeight();
+
+        if (sourceAspect > destinationAspect)
+        {
+            const float croppedWidth = source.getHeight() * destinationAspect;
+            source = source.withSizeKeepingCentre (croppedWidth, source.getHeight());
+        }
+        else
+        {
+            const float croppedHeight = source.getWidth() / destinationAspect;
+            source = source.withSizeKeepingCentre (source.getWidth(), croppedHeight);
+        }
+
+        const auto destinationPixels = destination.toNearestInt();
+        const auto sourcePixels = source.toNearestInt();
+        g.drawImage (image,
+                     destinationPixels.getX(), destinationPixels.getY(),
+                     destinationPixels.getWidth(), destinationPixels.getHeight(),
+                     sourcePixels.getX(), sourcePixels.getY(),
+                     sourcePixels.getWidth(), sourcePixels.getHeight());
+    }
+
+    juce::Rectangle<int> shrinkScoreArea (juce::Rectangle<int> area)
+    {
+        return area.withSizeKeepingCentre (area.getWidth(),
+                                           (int) std::round ((float) area.getHeight() * 0.90f));
+    }
+
+    juce::Rectangle<int> getModuleBounds (juce::Rectangle<int> windowBounds)
+    {
+        const auto available = windowBounds.reduced (kOuterMargin);
+        return available.withSizeKeepingCentre ((int) std::round ((float) available.getWidth() * kModuleScale),
+                                                (int) std::round ((float) available.getHeight() * kModuleScale));
+    }
+
+    int getExpandedSpectrogramHeight (int leftPanelHeight)
+    {
+        const auto previousAvailableHeight = juce::jmax (0, leftPanelHeight - kSpectrogramTopOffset);
+        return (int) std::round ((float) previousAvailableHeight * 0.39f * 1.20f);
     }
 
     juce::String musicGlyph (juce::juce_wchar codepoint)
@@ -95,7 +282,7 @@ namespace
     juce::Font makeMusicFont (float height)
     {
         auto options = juce::FontOptions {}
-                           .withHeight (height)
+                           .withHeight (height * 1.20f)
                            .withFallbackEnabled (true)
                            .withFallbacks ({ "Apple Symbols", "Arial Unicode MS", "Arial Unicode" });
 
@@ -107,14 +294,15 @@ namespace
 
     juce::Font makeUIFont (float height, bool bold = false)
     {
+        constexpr float uiFontScale = 1.44f;
         auto options = juce::FontOptions {}
-                           .withName ("STHeiti SC")
-                           .withHeight (height)
+                           .withName ("Avenir Next")
+                           .withHeight (height * uiFontScale)
                            .withFallbackEnabled (true)
-                           .withFallbacks ({ "Heiti SC", "PingFang SC", "Hiragino Sans GB", "Helvetica Neue" });
+                           .withFallbacks ({ "Avenir", "PingFang SC", "Hiragino Sans GB", "Helvetica Neue" });
 
         if (bold)
-            options = options.withStyle ("Medium");
+            options = options.withStyle ("Demi Bold");
 
         return juce::Font (options);
     }
@@ -122,12 +310,36 @@ namespace
     juce::Font makeTitleFont (float height)
     {
         auto options = juce::FontOptions {}
-                           .withName ("DIN Alternate")
-                           .withHeight (height)
+                           .withName ("Avenir Next")
+                           .withHeight (height * 1.20f)
                            .withFallbackEnabled (true)
-                           .withFallbacks ({ "DIN Condensed", "Avenir Next Condensed", "Helvetica Neue" });
+                           .withFallbacks ({ "Avenir", "Helvetica Neue" })
+                           .withStyle ("Regular");
 
-        return juce::Font (options).boldened();
+        return juce::Font (options);
+    }
+
+    void drawTrackedText (juce::Graphics& g,
+                          const juce::String& text,
+                          juce::Rectangle<float> bounds,
+                          const juce::Font& font,
+                          juce::Colour colour,
+                          float tracking)
+    {
+        juce::GlyphArrangement glyphs;
+        glyphs.addLineOfText (font, text, 0.0f, font.getAscent());
+        for (int index = 1; index < glyphs.getNumGlyphs(); ++index)
+            glyphs.getGlyph (index).moveBy (tracking * (float) index, 0.0f);
+
+        glyphs.justifyGlyphs (0,
+                              glyphs.getNumGlyphs(),
+                              bounds.getX(),
+                              bounds.getY(),
+                              bounds.getWidth(),
+                              bounds.getHeight(),
+                              juce::Justification::centred);
+        g.setColour (colour);
+        glyphs.draw (g);
     }
 
     juce::String accidentalGlyphForStaff (const juce::String& accidental)
@@ -178,37 +390,238 @@ namespace
     class MinimalPluginLookAndFeel : public juce::LookAndFeel_V4
     {
     public:
-        juce::Font getTextButtonFont (juce::TextButton&, int buttonHeight) override
+        void preparePopupMenuWindow (juce::Component& window) override
         {
-            return makeUIFont ((float) buttonHeight * 0.36f, true);
+            window.setOpaque (false);
+        }
+
+        void drawPopupMenuBackground (juce::Graphics& g, int width, int height) override
+        {
+            g.setColour (juce::Colours::transparentBlack);
+            g.fillAll();
+
+            auto bounds = juce::Rectangle<float> (0.0f, 0.0f, (float) width, (float) height).reduced (1.0f);
+            g.setColour (juce::Colour::fromRGB (164, 167, 161).withAlpha (0.30f));
+            g.fillRoundedRectangle (bounds, kUnifiedCornerRadius);
+            g.setColour (juce::Colours::white.withAlpha (0.18f));
+            g.drawRoundedRectangle (bounds, kUnifiedCornerRadius, 0.8f);
+        }
+
+        void drawPopupMenuItem (juce::Graphics& g,
+                                const juce::Rectangle<int>& area,
+                                bool isSeparator,
+                                bool isActive,
+                                bool isHighlighted,
+                                bool isTicked,
+                                bool hasSubMenu,
+                                const juce::String& text,
+                                const juce::String& shortcutKeyText,
+                                const juce::Drawable* icon,
+                                const juce::Colour* textColour) override
+        {
+            juce::ignoreUnused (isTicked, hasSubMenu, shortcutKeyText, icon, textColour);
+
+            if (isSeparator)
+                return;
+
+            auto item = area.reduced (5, 2);
+            if (isHighlighted && isActive)
+            {
+                g.setColour (juce::Colour::fromRGB (119, 137, 102).withAlpha (0.28f));
+                g.fillRoundedRectangle (item.toFloat(), 8.0f);
+            }
+
+            auto marker = item.removeFromLeft (13);
+            g.setColour ((isHighlighted ? kButtonTerracottaMuted : kTextSecondary)
+                             .withAlpha (isActive ? (isHighlighted ? 0.88f : 0.36f) : 0.16f));
+            g.fillEllipse ((float) marker.getCentreX() - 2.2f,
+                           (float) marker.getCentreY() - 2.2f,
+                           4.4f,
+                           4.4f);
+
+            g.setColour (kTextPrimary.withAlpha (isActive ? 0.92f : 0.36f));
+            g.setFont (makeUIFont (8.0f, false));
+            g.drawText (text, item.reduced (2, 0), juce::Justification::centredLeft);
+        }
+
+        void getIdealPopupMenuItemSize (const juce::String& text,
+                                        bool isSeparator,
+                                        int standardMenuItemHeight,
+                                        int& idealWidth,
+                                        int& idealHeight) override
+        {
+            juce::ignoreUnused (text, standardMenuItemHeight);
+            idealWidth = isSeparator ? 100 : 112;
+            idealHeight = isSeparator ? 4 : 24;
+        }
+
+        juce::Font getTextButtonFont (juce::TextButton& button, int buttonHeight) override
+        {
+            const bool useLargeText = (bool) button.getProperties().getWithDefault (
+                juce::Identifier ("largeButtonText"), false);
+            const float fontSizeOffset = (float) (double) button.getProperties().getWithDefault (
+                juce::Identifier ("fontSizeOffset"), 0.0);
+            const float height = (float) buttonHeight * (useLargeText ? 0.56f : 0.43f)
+                               + fontSizeOffset;
+
+            return juce::Font (juce::FontOptions {}
+                                   .withName ("Avenir Next")
+                                   .withStyle (useLargeText ? "Regular" : "Demi Bold")
+                                   .withHeight (height)
+                                   .withFallbackEnabled (true)
+                                   .withFallbacks ({ "Avenir", "Helvetica Neue" }));
         }
 
         void drawButtonBackground (juce::Graphics& g,
                                    juce::Button& button,
-                                   const juce::Colour&,
+                                   const juce::Colour& backgroundColour,
                                    bool shouldDrawButtonAsHighlighted,
                                    bool shouldDrawButtonAsDown) override
         {
             auto bounds = button.getLocalBounds().toFloat().reduced (0.5f);
-            auto colour = button.getToggleState() ? kButtonTerracottaStrong : kButtonTerracotta;
+            const bool isTextTab = (bool) button.getProperties().getWithDefault (
+                juce::Identifier ("textTab"), false);
+            const bool isParameterToggle = (bool) button.getProperties().getWithDefault (
+                juce::Identifier ("parameterToggle"), false);
+            const bool isPrimaryAction = (bool) button.getProperties().getWithDefault (
+                juce::Identifier ("primaryAction"), false);
+            const bool isSecondaryAction = (bool) button.getProperties().getWithDefault (
+                juce::Identifier ("secondaryAction"), false);
+            const bool isOutlineAction = (bool) button.getProperties().getWithDefault (
+                juce::Identifier ("outlineAction"), false);
+
+            if (isTextTab)
+            {
+                if (button.getToggleState())
+                {
+                    g.setColour (kButtonTerracottaMuted);
+                    g.fillRect (bounds.getX() + 3.0f,
+                                bounds.getBottom() - 3.5f,
+                                bounds.getWidth() - 6.0f,
+                                3.0f);
+                }
+                return;
+            }
+
+            if (isParameterToggle)
+                return;
+
+            if (isPrimaryAction)
+            {
+                const bool organicActionIsActive = button.getToggleState();
+                auto flowerLight = juce::Colour::fromRGB (255, 203, 62);  // sampled golden highlight
+                auto flowerGold = juce::Colour::fromRGB (247, 177, 18);   // dominant reference colour
+                auto flowerDeep = juce::Colour::fromRGB (218, 137, 5);    // shaded lower edge
+                if (! button.isEnabled() && ! organicActionIsActive)
+                {
+                    flowerLight = flowerLight.withMultipliedAlpha (0.34f);
+                    flowerGold = flowerGold.withMultipliedAlpha (0.34f);
+                    flowerDeep = flowerDeep.withMultipliedAlpha (0.34f);
+                }
+                else if (shouldDrawButtonAsDown)
+                {
+                    flowerLight = flowerLight.darker (0.10f);
+                    flowerGold = flowerGold.darker (0.10f);
+                    flowerDeep = flowerDeep.darker (0.10f);
+                }
+                else if (shouldDrawButtonAsHighlighted)
+                {
+                    flowerLight = flowerLight.brighter (0.06f);
+                    flowerGold = flowerGold.brighter (0.06f);
+                }
+
+                const auto flower = bounds.withSizeKeepingCentre (juce::jmin (84.0f, bounds.getWidth()),
+                                                                  juce::jmin (34.0f, bounds.getHeight()));
+                const auto blossom = makeOrganicCapsulePath (flower, 0.92f);
+
+                if (organicActionIsActive)
+                {
+                    juce::ColourGradient flowerGradient (flowerLight.withAlpha (0.30f),
+                                                          flower.getCentreX() - 8.0f,
+                                                          flower.getY(),
+                                                          flowerDeep.withAlpha (0.30f),
+                                                          flower.getCentreX() + 5.0f,
+                                                          flower.getBottom(),
+                                                          false);
+                    flowerGradient.addColour (0.48, flowerGold.withAlpha (0.30f));
+                    g.setGradientFill (flowerGradient);
+                    g.fillPath (blossom);
+
+                    g.setColour (flowerGold.withAlpha (0.58f));
+                    g.strokePath (blossom,
+                                  juce::PathStrokeType (1.25f,
+                                                        juce::PathStrokeType::curved,
+                                                        juce::PathStrokeType::rounded));
+
+                    g.setColour (juce::Colours::white.withAlpha (0.05f));
+                    g.fillEllipse (flower.getCentreX() - 17.0f,
+                                   flower.getCentreY() - 10.0f,
+                                   31.0f,
+                                   15.0f);
+                }
+                else
+                {
+                    g.setColour (flowerLight.withAlpha (button.isEnabled() ? 0.12f : 0.05f));
+                    g.fillPath (blossom);
+                    g.setColour (flowerGold.withAlpha (button.isEnabled() ? 0.72f : 0.28f));
+                    g.strokePath (blossom,
+                                  juce::PathStrokeType (1.35f,
+                                                        juce::PathStrokeType::curved,
+                                                        juce::PathStrokeType::rounded));
+                }
+                return;
+            }
+
+            if (isSecondaryAction || isOutlineAction)
+            {
+                auto colour = juce::Colours::white.withAlpha (isOutlineAction ? 0.10f : 0.18f);
+
+                if (! button.isEnabled())
+                    colour = colour.withMultipliedAlpha (0.38f);
+                else if (shouldDrawButtonAsDown)
+                    colour = colour.darker (0.10f);
+                else if (shouldDrawButtonAsHighlighted)
+                    colour = colour.brighter (0.06f);
+
+                const auto organicBounds = bounds.reduced (0.2f);
+                const auto organicPath = makeOrganicCapsulePath (organicBounds,
+                                                                 isOutlineAction ? 0.22f : 0.28f);
+                g.setColour (colour);
+                g.fillPath (organicPath);
+
+                g.setColour ((isOutlineAction ? juce::Colours::white : kTextPrimary)
+                                 .withAlpha (isOutlineAction ? 0.16f : 0.04f));
+                g.strokePath (organicPath,
+                              juce::PathStrokeType (0.9f,
+                                                    juce::PathStrokeType::curved,
+                                                    juce::PathStrokeType::rounded));
+                return;
+            }
+
+            auto colour = button.getToggleState()
+                            ? button.findColour (juce::TextButton::buttonOnColourId)
+                            : backgroundColour;
 
             if (! button.isEnabled())
-                colour = kButtonTerracotta.withMultipliedAlpha (0.45f);
+                colour = kButtonTerracotta.darker (0.18f);
             else if (shouldDrawButtonAsDown)
                 colour = colour.darker (0.12f);
             else if (shouldDrawButtonAsHighlighted)
                 colour = colour.brighter (0.06f);
 
-            const auto cornerSize = bounds.getHeight() * 0.48f;
+            const auto requestedOpacity = (float) (double) button.getProperties().getWithDefault (
+                juce::Identifier ("backgroundOpacity"), (double) kButtonBackgroundAlpha);
+            colour = colour.withAlpha (juce::jlimit (0.0f, 1.0f, requestedOpacity));
+
             auto shadowBounds = bounds.translated (0.0f, 1.3f);
             g.setColour (juce::Colours::black.withAlpha (button.isEnabled() ? 0.11f : 0.05f));
-            g.fillRoundedRectangle (shadowBounds, cornerSize);
+            g.fillRoundedRectangle (shadowBounds, kUnifiedCornerRadius);
 
             g.setColour (colour);
-            g.fillRoundedRectangle (bounds, cornerSize);
+            g.fillRoundedRectangle (bounds, kUnifiedCornerRadius);
 
             g.setColour (juce::Colours::white.withAlpha (0.10f));
-            g.drawRoundedRectangle (bounds.reduced (0.8f), cornerSize, 0.9f);
+            g.drawRoundedRectangle (bounds.reduced (0.8f), kUnifiedCornerRadius, 0.9f);
         }
 
         void drawButtonText (juce::Graphics& g,
@@ -216,6 +629,75 @@ namespace
                              bool,
                              bool) override
         {
+            const bool isTextTab = (bool) button.getProperties().getWithDefault (
+                juce::Identifier ("textTab"), false);
+            const bool isParameterToggle = (bool) button.getProperties().getWithDefault (
+                juce::Identifier ("parameterToggle"), false);
+            const bool isOutlineAction = (bool) button.getProperties().getWithDefault (
+                juce::Identifier ("outlineAction"), false);
+            const bool isPrimaryAction = (bool) button.getProperties().getWithDefault (
+                juce::Identifier ("primaryAction"), false);
+
+            if (isTextTab || isParameterToggle)
+            {
+                const auto textColour = isParameterToggle
+                                          ? (button.getToggleState() ? kAmberText : kTextPrimary)
+                                          : (button.getToggleState() ? kTextPrimary : kTextSecondary);
+                g.setColour (textColour.withAlpha (button.isEnabled() ? 0.98f : 0.38f));
+                g.setFont (makeUIFont (12.5f, false));
+                auto textBounds = button.getLocalBounds().reduced (isParameterToggle ? 4 : 6, 2);
+                g.drawFittedText (button.getButtonText(),
+                                  textBounds,
+                                  isParameterToggle ? juce::Justification::centredLeft
+                                                    : juce::Justification::centred,
+                                  1);
+                return;
+            }
+
+            if (isOutlineAction)
+            {
+                auto textBounds = button.getLocalBounds().reduced (9, 2);
+                auto iconBounds = textBounds.removeFromLeft (14).toFloat().reduced (3.0f, 2.8f);
+                auto arrowBounds = textBounds.removeFromRight (13).toFloat();
+                juce::Path fileIcon;
+                fileIcon.startNewSubPath (iconBounds.getX(), iconBounds.getY());
+                fileIcon.lineTo (iconBounds.getRight() - 3.5f, iconBounds.getY());
+                fileIcon.lineTo (iconBounds.getRight(), iconBounds.getY() + 3.5f);
+                fileIcon.lineTo (iconBounds.getRight(), iconBounds.getBottom());
+                fileIcon.lineTo (iconBounds.getX(), iconBounds.getBottom());
+                fileIcon.closeSubPath();
+                g.setColour (kButtonTerracottaMuted.withAlpha (button.isEnabled() ? 0.95f : 0.34f));
+                g.strokePath (fileIcon, juce::PathStrokeType (1.2f));
+
+                g.setColour (kTextPrimary.withAlpha (button.isEnabled() ? 0.98f : 0.38f));
+                g.setFont (makeUIFont (10.0f, false));
+                g.drawFittedText (button.getButtonText(),
+                                  textBounds.reduced (2, 0),
+                                  juce::Justification::centredLeft,
+                                  1);
+
+                const float arrowY = arrowBounds.getCentreY();
+                const float arrowLeft = arrowBounds.getX() + 2.0f;
+                const float arrowRight = arrowBounds.getRight() - 2.0f;
+                g.setColour (kTextSecondary.withAlpha (button.isEnabled() ? 0.70f : 0.24f));
+                g.drawLine (arrowLeft, arrowY, arrowRight, arrowY, 1.0f);
+                g.drawLine (arrowRight - 3.0f, arrowY - 2.5f, arrowRight, arrowY, 1.0f);
+                g.drawLine (arrowRight - 3.0f, arrowY + 2.5f, arrowRight, arrowY, 1.0f);
+                return;
+            }
+
+            if (isPrimaryAction)
+            {
+                const bool active = button.getToggleState();
+                g.setColour (kTextPrimary.withAlpha (active || button.isEnabled() ? 0.94f : 0.34f));
+                g.setFont (makeUIFont (10.2f, false));
+                g.drawFittedText (button.getButtonText(),
+                                  button.getLocalBounds().withSizeKeepingCentre (62, 22),
+                                  juce::Justification::centred,
+                                  1);
+                return;
+            }
+
             g.setColour (button.findColour (button.getToggleState() ? juce::TextButton::textColourOnId
                                                                     : juce::TextButton::textColourOffId));
             g.setFont (getTextButtonFont (button, button.getHeight()));
@@ -228,13 +710,14 @@ namespace
 
     void styleTextButton (juce::TextButton& button, bool emphasised = false)
     {
-        const auto offColour = emphasised ? kButtonTerracottaStrong : kButtonTerracotta;
-        const auto onColour = kButtonTerracottaMuted;
+        juce::ignoreUnused (emphasised);
+        const auto offColour = kButtonTerracotta;
+        const auto onColour = kButtonTerracottaStrong;
 
         button.setColour (juce::TextButton::buttonColourId, offColour);
         button.setColour (juce::TextButton::buttonOnColourId, onColour);
-        button.setColour (juce::TextButton::textColourOffId, kButtonText);
-        button.setColour (juce::TextButton::textColourOnId, kButtonText);
+        button.setColour (juce::TextButton::textColourOffId, kTextPrimary);
+        button.setColour (juce::TextButton::textColourOnId, kAmberText);
     }
 
     struct PitchNotation
@@ -243,6 +726,7 @@ namespace
         juce::String displayLabel;
         juce::String accidentalForStaff;
         int diatonicNumber = 0;
+        float intensity = 1.0f;
     };
 
     struct QuantisedPitchClass
@@ -355,11 +839,27 @@ namespace
         std::vector<PitchNotation> notes;
         notes.reserve (snapshot.freqsHz.size());
 
-        for (float freqHz : snapshot.freqsHz)
+        for (size_t peakIndex = 0; peakIndex < snapshot.freqsHz.size(); ++peakIndex)
         {
-            const auto notation = quantiseFrequencyToPitchNotation (freqHz, snapshot.useQuarterToneMode);
-            if (notation.valid)
-                notes.push_back (notation);
+            auto notation = quantiseFrequencyToPitchNotation (snapshot.freqsHz[peakIndex],
+                                                               snapshot.useQuarterToneMode);
+            if (! notation.valid)
+                continue;
+
+            notation.intensity = juce::jlimit (0.0f, 1.0f,
+                                                snapshot.partialIntensities[peakIndex]);
+
+            const auto duplicate = std::find_if (notes.begin(), notes.end(),
+                                                  [&notation] (const auto& note)
+                                                  {
+                                                      return note.diatonicNumber == notation.diatonicNumber
+                                                          && note.accidentalForStaff == notation.accidentalForStaff;
+                                                  });
+
+            if (duplicate != notes.end())
+                duplicate->intensity = juce::jmax (duplicate->intensity, notation.intensity);
+            else
+                notes.push_back (std::move (notation));
         }
 
         std::sort (notes.begin(), notes.end(),
@@ -379,6 +879,7 @@ namespace
         bool valid = false;
         int midiNote = -1;
         int pitchWheelValue = kPitchBendCentre;
+        float intensity = 1.0f;
     };
 
     struct MusicXmlPitch
@@ -506,16 +1007,12 @@ namespace
                  : QuantisedMidiNote {};
     }
 
-    bool containsMidiNote (const std::vector<QuantisedMidiNote>& notes,
-                           int midiNote,
-                           int pitchWheelValue)
+    juce::uint8 midiVelocityForPartialIntensity (float intensity)
     {
-        return std::any_of (notes.begin(), notes.end(),
-                            [midiNote, pitchWheelValue] (const auto& note)
-                            {
-                                return note.midiNote == midiNote
-                                    && note.pitchWheelValue == pitchWheelValue;
-                            });
+        const float linearIntensity = juce::jlimit (0.0f, 1.0f, intensity);
+        return (juce::uint8) std::round (juce::jmap (linearIntensity,
+                                                     (float) kMinimumPartialVelocity,
+                                                     127.0f));
     }
 
     void appendPitchBendRangeSetup (juce::MidiMessageSequence& sequence, int channel, double timeStamp)
@@ -541,7 +1038,6 @@ namespace
                                   const std::vector<FrozenChordSnapshot>& snapshots,
                                   double timeScale)
     {
-        constexpr int velocity = 96;
         const double exportTimeScale = sanitiseMidiTimeScale (timeScale);
 
         for (int channel = 1; channel <= AudioPluginAudioProcessor::kNumNoisyPeaks; ++channel)
@@ -559,14 +1055,31 @@ namespace
             std::vector<QuantisedMidiNote> quantisedNotes;
             quantisedNotes.reserve (snapshots[chordIndex].freqsHz.size());
 
-            for (float freqHz : snapshots[chordIndex].freqsHz)
+            for (size_t peakIndex = 0;
+                 peakIndex < snapshots[chordIndex].freqsHz.size();
+                 ++peakIndex)
             {
-                const auto midiNote = quantiseFrequencyToMidiNote (freqHz, snapshots[chordIndex].useQuarterToneMode);
+                auto midiNote = quantiseFrequencyToMidiNote (
+                    snapshots[chordIndex].freqsHz[peakIndex],
+                    snapshots[chordIndex].useQuarterToneMode);
                 if (! midiNote.valid)
                     continue;
 
-                if (containsMidiNote (quantisedNotes, midiNote.midiNote, midiNote.pitchWheelValue))
+                midiNote.intensity = juce::jlimit (
+                    0.0f, 1.0f, snapshots[chordIndex].partialIntensities[peakIndex]);
+
+                const auto duplicate = std::find_if (quantisedNotes.begin(), quantisedNotes.end(),
+                                                      [&midiNote] (const auto& note)
+                                                      {
+                                                          return note.midiNote == midiNote.midiNote
+                                                              && note.pitchWheelValue == midiNote.pitchWheelValue;
+                                                      });
+
+                if (duplicate != quantisedNotes.end())
+                {
+                    duplicate->intensity = juce::jmax (duplicate->intensity, midiNote.intensity);
                     continue;
+                }
 
                 quantisedNotes.push_back (midiNote);
             }
@@ -576,9 +1089,10 @@ namespace
                 int channel = 1;
                 for (const auto& note : quantisedNotes)
                 {
+                    const auto velocity = midiVelocityForPartialIntensity (note.intensity);
                     eventTrack.addEvent (juce::MidiMessage::pitchWheel (channel, note.pitchWheelValue),
                                          startBeat * kMidiTicksPerQuarter);
-                    eventTrack.addEvent (juce::MidiMessage::noteOn (channel, note.midiNote, (juce::uint8) velocity),
+                    eventTrack.addEvent (juce::MidiMessage::noteOn (channel, note.midiNote, velocity),
                                          startBeat * kMidiTicksPerQuarter);
                     eventTrack.addEvent (juce::MidiMessage::noteOff (channel, note.midiNote),
                                          endBeat * kMidiTicksPerQuarter);
@@ -593,7 +1107,8 @@ namespace
             {
                 for (const auto& note : quantisedNotes)
                 {
-                    eventTrack.addEvent (juce::MidiMessage::noteOn (1, note.midiNote, (juce::uint8) velocity),
+                    const auto velocity = midiVelocityForPartialIntensity (note.intensity);
+                    eventTrack.addEvent (juce::MidiMessage::noteOn (1, note.midiNote, velocity),
                                          startBeat * kMidiTicksPerQuarter);
                     eventTrack.addEvent (juce::MidiMessage::noteOff (1, note.midiNote),
                                          endBeat * kMidiTicksPerQuarter);
@@ -835,7 +1350,7 @@ namespace
     }
 }
 
-class AutoDetectionXYPad : public juce::Component
+class SensitivityControl : public juce::Component
 {
 public:
     float getSensitivity() const noexcept
@@ -845,44 +1360,47 @@ public:
 
     double getMinGapMs() const noexcept
     {
-        constexpr double shortestGapMs = 250.0;
-        constexpr double longestGapMs = 1500.0;
-        return longestGapMs * std::pow (shortestGapMs / longestGapMs,
-                                       (double) captureRatePosition);
+        return kAutoMinimumGapMs;
     }
 
     void paint (juce::Graphics& g) override
     {
-        const auto bounds = getLocalBounds().toFloat();
-        g.setColour (kPanelTint.withMultipliedAlpha (0.16f));
-        g.fillRoundedRectangle (bounds, 7.0f);
-        g.setColour (kTextPrimary.withAlpha (0.16f));
-        g.drawRoundedRectangle (bounds.reduced (0.5f), 7.0f, 1.0f);
-
-        const auto plot = getPlotBounds();
-        g.setColour (kTextPrimary.withAlpha (0.10f));
-        g.drawRect (plot, 0.8f);
-        g.drawLine (plot.getX(), plot.getCentreY(), plot.getRight(), plot.getCentreY(), 0.7f);
-        g.drawLine (plot.getCentreX(), plot.getY(), plot.getCentreX(), plot.getBottom(), 0.7f);
-
-        const juce::Point<float> origin { plot.getX(), plot.getBottom() };
-        const juce::Point<float> point {
-            plot.getX() + sensitivityPosition * plot.getWidth(),
-            plot.getBottom() - captureRatePosition * plot.getHeight()
-        };
-
-        g.setColour (kButtonTerracotta.withAlpha (0.54f));
-        g.drawLine ({ origin, point }, 1.3f);
-        g.fillEllipse (juce::Rectangle<float> (7.0f, 7.0f).withCentre (point));
-
-        g.setColour (kTextSecondary.withAlpha (0.78f));
-        g.setFont (makeUIFont (6.1f, true));
-        g.drawText ("SENSITIVE",
-                    getLocalBounds().removeFromTop (10).removeFromRight (62).reduced (3, 0),
+        auto bounds = getLocalBounds();
+        auto title = bounds.removeFromTop (16);
+        g.setColour (kTextPrimary);
+        g.setFont (makeUIFont (8.6f, true));
+        g.drawText ("SENSITIVITY", title, juce::Justification::centredLeft);
+        g.setColour (kTextSecondary);
+        g.setFont (makeUIFont (8.5f, false));
+        g.drawText (juce::String ((int) std::round (sensitivityPosition * 100.0f)) + "%",
+                    title,
                     juce::Justification::centredRight);
-        g.drawText ("NON-SENSITIVE",
-                    getLocalBounds().removeFromBottom (10).removeFromLeft (76).reduced (3, 0),
-                    juce::Justification::centredLeft);
+
+        const auto track = getTrackBounds();
+        const float pointX = track.getX() + sensitivityPosition * track.getWidth();
+        const auto neutralTrack = makeOrganicCapsulePath (
+            juce::Rectangle<float> (track.getX(), track.getCentreY() - 1.1f, track.getWidth(), 2.2f),
+            0.16f);
+        g.setColour (kTextPrimary.withAlpha (0.22f));
+        g.fillPath (neutralTrack);
+
+        const auto activeTrack = makeOrganicCapsulePath (
+            juce::Rectangle<float> (track.getX(),
+                                    track.getCentreY() - 1.45f,
+                                    juce::jmax (2.0f, pointX - track.getX()),
+                                    2.9f),
+            0.24f);
+        g.setColour (kButtonTerracottaMuted);
+        g.fillPath (activeTrack);
+        g.fillPath (makeOrganicCapsulePath (
+            juce::Rectangle<float> (pointX - 5.0f, track.getCentreY() - 4.0f, 10.0f, 8.0f),
+            0.52f));
+
+        auto labels = getLocalBounds().removeFromBottom (12);
+        g.setColour (kTextSecondary.withAlpha (0.76f));
+        g.setFont (makeUIFont (7.6f, false));
+        g.drawText ("Less", labels, juce::Justification::centredLeft);
+        g.drawText ("More", labels, juce::Justification::centredRight);
     }
 
     void mouseDown (const juce::MouseEvent& event) override
@@ -897,26 +1415,151 @@ public:
 
 private:
     float sensitivityPosition = 5.0f / 7.0f; // Default sensitivity: 6.0.
-    float captureRatePosition = (float) (std::log (400.0 / 1500.0)
-                                          / std::log (250.0 / 1500.0));
 
-    juce::Rectangle<float> getPlotBounds() const
+    juce::Rectangle<float> getTrackBounds() const
     {
-        auto plot = getLocalBounds().toFloat().reduced (8.0f);
-        plot.removeFromTop (4.0f);
-        plot.removeFromBottom (4.0f);
-        return plot;
+        auto track = getLocalBounds().toFloat().reduced (3.0f, 0.0f);
+        track.removeFromTop (19.0f);
+        track.removeFromBottom (12.0f);
+        return track;
     }
 
     void updateFromMouse (juce::Point<float> position)
     {
-        const auto plot = getPlotBounds();
+        const auto plot = getTrackBounds();
         sensitivityPosition = juce::jlimit (0.0f, 1.0f,
                                             (position.x - plot.getX()) / plot.getWidth());
-        captureRatePosition = juce::jlimit (0.0f, 1.0f,
-                                            (plot.getBottom() - position.y) / plot.getHeight());
         repaint();
     }
+};
+
+class CaptureModeSelector : public juce::Component
+{
+public:
+    std::function<void(int)> onSelectionChanged;
+
+    void setSelectedIndex (int newIndex)
+    {
+        selectedIndex = juce::jlimit (0, 1, newIndex);
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto bounds = getLocalBounds().toFloat();
+        const auto outerPath = makeOrganicCapsulePath (bounds, 0.20f);
+        g.setColour (juce::Colour::fromRGB (226, 233, 216).withAlpha (0.20f));
+        g.fillPath (outerPath);
+
+        const juce::String labels[] { "AUTO", "MANUAL" };
+        for (int index = 0; index < 2; ++index)
+        {
+            const auto segment = getSegmentBounds (index);
+            if (index == selectedIndex)
+            {
+                juce::ColourGradient mossGradient (juce::Colour::fromRGB (137, 157, 113).withAlpha (0.76f),
+                                                    segment.getX(),
+                                                    segment.getY(),
+                                                    juce::Colour::fromRGB (91, 112, 78).withAlpha (0.72f),
+                                                    segment.getRight(),
+                                                    segment.getBottom(),
+                                                    false);
+                g.setGradientFill (mossGradient);
+                g.fillPath (makeOrganicCapsulePath (segment.toFloat().reduced (1.0f), 0.34f));
+            }
+
+            g.setColour (index == selectedIndex ? kAmberText : kTextPrimary);
+            g.setFont (makeUIFont (10.0f, index == selectedIndex));
+            g.drawText (labels[index], segment, juce::Justification::centred);
+        }
+
+    }
+
+    void mouseDown (const juce::MouseEvent& event) override
+    {
+        const int newIndex = event.x < getWidth() / 2 ? 0 : 1;
+        if (newIndex == selectedIndex)
+            return;
+        selectedIndex = newIndex;
+        repaint();
+        if (onSelectionChanged)
+            onSelectionChanged (selectedIndex);
+    }
+
+private:
+    juce::Rectangle<int> getSegmentBounds (int index) const
+    {
+        const int middle = getWidth() / 2;
+        return index == 0 ? juce::Rectangle<int> (0, 0, middle, getHeight())
+                          : juce::Rectangle<int> (middle, 0, getWidth() - middle, getHeight());
+    }
+
+    int selectedIndex = 0;
+};
+
+class TuningSelector : public juce::Component
+{
+public:
+    std::function<void(bool)> onQuarterToneChanged;
+
+    void setQuarterToneEnabled (bool shouldUseQuarterTone)
+    {
+        quarterToneEnabled = shouldUseQuarterTone;
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto bounds = getLocalBounds();
+        auto control = bounds.toFloat();
+        const auto outerPath = makeOrganicCapsulePath (control, 0.18f);
+        g.setColour (juce::Colours::white.withAlpha (0.24f));
+        g.fillPath (outerPath);
+
+        for (int index = 0; index < 2; ++index)
+        {
+            const auto segment = getSegmentBounds (index);
+            const bool selected = quarterToneEnabled == (index == 1);
+            if (selected)
+            {
+                juce::ColourGradient mossGradient (juce::Colour::fromRGB (137, 157, 113).withAlpha (0.76f),
+                                                    segment.getX(),
+                                                    segment.getY(),
+                                                    juce::Colour::fromRGB (91, 112, 78).withAlpha (0.72f),
+                                                    segment.getRight(),
+                                                    segment.getBottom(),
+                                                    false);
+                g.setGradientFill (mossGradient);
+                g.fillPath (makeOrganicCapsulePath (segment.toFloat().reduced (1.0f), 0.28f));
+            }
+            g.setColour (selected ? kAmberText : kTextPrimary);
+            g.setFont (makeUIFont (9.2f, selected));
+            g.drawText (index == 0 ? "SEMITONE" : "QUARTER-TONE",
+                        segment,
+                        juce::Justification::centred);
+        }
+    }
+
+    void mouseDown (const juce::MouseEvent& event) override
+    {
+        const bool newQuarterTone = event.x >= getWidth() / 2;
+        if (newQuarterTone == quarterToneEnabled)
+            return;
+        quarterToneEnabled = newQuarterTone;
+        repaint();
+        if (onQuarterToneChanged)
+            onQuarterToneChanged (quarterToneEnabled);
+    }
+
+private:
+    juce::Rectangle<int> getSegmentBounds (int index) const
+    {
+        const int middle = getWidth() / 2;
+        return index == 0 ? juce::Rectangle<int> (0, 0, middle, getHeight())
+                          : juce::Rectangle<int> (middle, 0, getWidth() - middle, getHeight());
+    }
+
+    bool quarterToneEnabled = false;
 };
 
 class FrozenChordStaffComponent : public juce::Component,
@@ -973,10 +1616,10 @@ public:
 
         header.removeFromLeft (72);
 
-        dragMidiBounds = header.removeFromRight (134).translated (0, -10).reduced (2, 0);
-        g.setColour (snapshots.empty() ? kButtonTerracotta.withMultipliedAlpha (0.42f)
-                                       : kButtonTerracotta);
-        g.fillRoundedRectangle (dragMidiBounds.toFloat(), 10.0f);
+        dragMidiBounds = header.removeFromRight (134).translated (0, 6).reduced (2, 0);
+        g.setColour (snapshots.empty() ? kButtonTerracotta.darker (0.12f).withAlpha (kButtonBackgroundAlpha)
+                                       : kButtonTerracotta.withAlpha (kButtonBackgroundAlpha));
+        g.fillRoundedRectangle (dragMidiBounds.toFloat(), kUnifiedCornerRadius);
         g.setColour (kButtonText);
         g.setFont (makeUIFont (10.8f, true));
         g.drawText ("Drag MIDI", dragMidiBounds, juce::Justification::centred);
@@ -1060,6 +1703,7 @@ private:
         float x = 0.0f;
         float y = 0.0f;
         int diatonicNumber = 0;
+        float alpha = 1.0f;
     };
 
     std::vector<FrozenChordSnapshot> snapshots;
@@ -1168,9 +1812,6 @@ private:
                 animationProgress = juce::jlimit (0.0f, 1.0f, (float) (elapsedSeconds / 0.28));
             }
 
-            const float easedProgress = 1.0f - std::pow (1.0f - animationProgress, 3.0f);
-            const float chordAlpha = 0.24f + 0.76f * easedProgress;
-
             if (animationProgress < 1.0f)
             {
                 const float glowAlpha = (1.0f - animationProgress) * 0.18f;
@@ -1179,10 +1820,10 @@ private:
                                                           32.0f,
                                                           (float) content.getHeight() - 16.0f);
                 g.setColour (kButtonTerracottaStrong.withAlpha (glowAlpha));
-                g.fillRoundedRectangle (glowBounds, 13.0f);
+                g.fillRoundedRectangle (glowBounds, kUnifiedCornerRadius);
             }
 
-            drawChord (g, content, notes, x, chordAlpha);
+            drawChord (g, content, notes, x);
 
             if (visibleIndex + 1 < visibleCount)
             {
@@ -1242,12 +1883,10 @@ private:
     void drawChord (juce::Graphics& g,
                     juce::Rectangle<int> area,
                     const std::vector<PitchNotation>& notes,
-                    float centerX,
-                    float alpha = 1.0f) const
+                    float centerX) const
     {
         const float noteHeadWidth = 5.8f;
         const float noteHeadHeight = 3.9f;
-        alpha = juce::jlimit (0.0f, 1.0f, alpha);
 
         int previousDiatonic = std::numeric_limits<int>::min();
         int clusterIndex = 0;
@@ -1262,13 +1901,20 @@ private:
             const float xOffset = (clusterIndex % 2 == 0) ? 0.0f : 2.8f;
             const float noteX = centerX + xOffset;
             const float noteY = yForDiatonicNumber (area, note.diatonicNumber);
+            // The detected peak level is already linearly normalised from the
+            // fixed dBFS calibration range. Keep notation linear as well; the
+            // small alpha floor preserves very quiet detected notes.
+            const float noteAlpha = juce::jmap (
+                juce::jlimit (0.0f, 1.0f, note.intensity),
+                0.06f,
+                1.0f);
 
-            g.setColour (kTextPrimary.withAlpha (alpha));
-            drawLedgerLines (g, area, noteX, note.diatonicNumber, alpha);
+            g.setColour (kTextPrimary.withAlpha (noteAlpha));
+            drawLedgerLines (g, area, noteX, note.diatonicNumber, noteAlpha);
 
             if (note.accidentalForStaff == "q#" || note.accidentalForStaff == "qb")
             {
-                g.setColour (kTextPrimary.withAlpha (alpha));
+                g.setColour (kTextPrimary.withAlpha (noteAlpha));
                 drawQuarterToneArrowMark (g,
                                           juce::Rectangle<float> (noteX - 10.0f, noteY - 5.5f, 6.0f, 11.0f),
                                           note.accidentalForStaff == "q#");
@@ -1278,7 +1924,7 @@ private:
                 const auto accidentalGlyph = accidentalGlyphForStaff (note.accidentalForStaff);
                 if (accidentalGlyph.isNotEmpty())
                 {
-                    g.setColour (kTextPrimary.withAlpha (alpha));
+                    g.setColour (kTextPrimary.withAlpha (noteAlpha));
                     g.setFont (makeMusicFont (8.0f));
                     g.drawText (accidentalGlyph,
                                 juce::Rectangle<float> (noteX - 10.0f, noteY - 5.0f, 8.0f, 10.0f).toNearestInt(),
@@ -1291,10 +1937,10 @@ private:
             noteHead.applyTransform (juce::AffineTransform::rotation (juce::degreesToRadians (-22.0f),
                                                                       noteX + noteHeadWidth * 0.5f,
                                                                       noteY));
-            g.setColour (kTextPrimary.withAlpha (alpha));
+            g.setColour (kTextPrimary.withAlpha (noteAlpha));
             g.fillPath (noteHead);
 
-            drawnNotes.push_back ({ noteX, noteY, note.diatonicNumber });
+            drawnNotes.push_back ({ noteX, noteY, note.diatonicNumber, noteAlpha });
 
             previousDiatonic = note.diatonicNumber;
             ++clusterIndex;
@@ -1303,20 +1949,25 @@ private:
         if (drawnNotes.empty())
             return;
 
+        const float stemAlpha = std::max_element (drawnNotes.begin(), drawnNotes.end(),
+                                                   [] (const auto& a, const auto& b)
+                                                   {
+                                                       return a.alpha < b.alpha;
+                                                   })->alpha;
         const bool stemDown = drawnNotes.back().diatonicNumber >= 34;
 
         if (stemDown)
         {
             const auto& anchor = drawnNotes.back();
             const float stemX = anchor.x + 0.8f;
-            g.setColour (kTextPrimary.withAlpha (alpha));
+            g.setColour (kTextPrimary.withAlpha (stemAlpha));
             g.drawLine (stemX, anchor.y, stemX, anchor.y + 14.4f, 1.0f);
         }
         else
         {
             const auto& anchor = drawnNotes.front();
             const float stemX = anchor.x + noteHeadWidth - 0.8f;
-            g.setColour (kTextPrimary.withAlpha (alpha));
+            g.setColour (kTextPrimary.withAlpha (stemAlpha));
             g.drawLine (stemX, anchor.y, stemX, anchor.y - 14.4f, 1.0f);
         }
     }
@@ -1342,13 +1993,39 @@ public:
     {
         const auto bounds = getLocalBounds().toFloat();
         const bool enabled = ! frames.empty();
-        g.setColour (enabled ? kButtonTerracotta : kButtonTerracotta.withMultipliedAlpha (0.42f));
-        g.fillRoundedRectangle (bounds, 9.0f);
-        g.setColour (kButtonText);
-        g.setFont (makeUIFont (8.6f, true));
-        g.drawText (snapshots.empty() ? "Drag Descriptor MIDI" : "Drag Combined MIDI",
-                    getLocalBounds(),
-                    juce::Justification::centred);
+        g.setColour (enabled ? kPanelTint.withAlpha (0.78f)
+                             : kButtonTerracotta.darker (0.08f).withAlpha (0.64f));
+        g.fillRoundedRectangle (bounds, kUnifiedCornerRadius);
+
+        const auto icon = juce::Rectangle<float> (bounds.getX() + 10.0f,
+                                                  bounds.getCentreY() - 6.0f,
+                                                  9.0f,
+                                                  12.0f);
+        juce::Path fileIcon;
+        fileIcon.startNewSubPath (icon.getX(), icon.getY());
+        fileIcon.lineTo (icon.getRight() - 3.0f, icon.getY());
+        fileIcon.lineTo (icon.getRight(), icon.getY() + 3.0f);
+        fileIcon.lineTo (icon.getRight(), icon.getBottom());
+        fileIcon.lineTo (icon.getX(), icon.getBottom());
+        fileIcon.closeSubPath();
+        fileIcon.startNewSubPath (icon.getRight() - 3.0f, icon.getY());
+        fileIcon.lineTo (icon.getRight() - 3.0f, icon.getY() + 3.0f);
+        fileIcon.lineTo (icon.getRight(), icon.getY() + 3.0f);
+
+        g.setColour ((enabled ? kButtonTerracottaMuted : kTextSecondary).withAlpha (0.86f));
+        g.strokePath (fileIcon, juce::PathStrokeType (0.9f));
+        g.drawLine (icon.getX() + 2.0f, icon.getBottom() - 4.0f,
+                    icon.getRight() - 2.0f, icon.getBottom() - 4.0f, 0.8f);
+
+        g.setColour (enabled ? kTextPrimary : kTextSecondary);
+        g.setFont (makeUIFont (8.4f, false));
+        g.drawFittedText (snapshots.empty() ? "Drag Descriptor MIDI" : "Drag Combined MIDI",
+                          getLocalBounds().withTrimmedLeft (25).withTrimmedRight (7),
+                          juce::Justification::centredLeft,
+                          1);
+
+        g.setColour (kTextPrimary.withAlpha (enabled ? 0.18f : 0.10f));
+        g.drawRoundedRectangle (bounds.reduced (0.5f), kUnifiedCornerRadius, 0.8f);
     }
 
     void mouseDown (const juce::MouseEvent&) override
@@ -1398,9 +2075,17 @@ public:
 
     void paint (juce::Graphics& g) override
     {
-        const auto bounds = getLocalBounds();
-        g.setColour (kPanelTint.withMultipliedAlpha (0.24f));
-        g.fillRoundedRectangle (bounds.toFloat(), 9.0f);
+        auto bounds = getLocalBounds();
+        g.setColour (kPanelTint.withAlpha (0.42f));
+        g.fillRoundedRectangle (bounds.toFloat(), kUnifiedCornerRadius);
+
+        g.setColour (kTextSecondary.withAlpha (0.76f));
+        g.setFont (makeUIFont (7.0f, false));
+        g.drawText ("TIME SCALE",
+                    bounds.removeFromLeft (labelWidth).reduced (7, 0),
+                    juce::Justification::centredLeft);
+
+        const auto multiplicationSign = juce::String::charToString ((juce::juce_wchar) 0x00d7);
 
         for (int index = 0; index < (int) timeScales.size(); ++index)
         {
@@ -1408,34 +2093,31 @@ public:
 
             if (index == selectedIndex)
             {
-                g.setColour (kButtonTerracottaStrong);
-                g.fillRoundedRectangle (segment.toFloat().reduced (1.0f), 8.0f);
-            }
-            else if (index > 0)
-            {
-                g.setColour (kTextPrimary.withAlpha (0.13f));
-                g.drawVerticalLine (segment.getX(), 5.0f, (float) getHeight() - 5.0f);
+                g.setColour (kButtonTerracottaMuted);
+                g.fillRect ((float) segment.getX() + 5.0f,
+                            (float) segment.getBottom() - 3.0f,
+                            (float) segment.getWidth() - 10.0f,
+                            2.0f);
             }
 
-            g.setColour (index == selectedIndex ? kButtonText : kSpectrogramLabel);
-            g.setFont (makeUIFont (8.0f, index == selectedIndex));
-            g.drawText ("*" + juce::String ((int) timeScales[(size_t) index]),
+            g.setColour (index == selectedIndex ? kAmberText
+                                                : kTextSecondary.withAlpha (0.82f));
+            g.setFont (makeUIFont (8.0f, false));
+            g.drawText (multiplicationSign + juce::String ((int) timeScales[(size_t) index]),
                         segment,
                         juce::Justification::centred);
         }
-
-        g.setColour (kButtonTerracotta.withMultipliedAlpha (0.72f));
-        g.drawRoundedRectangle (bounds.toFloat().reduced (0.5f), 9.0f, 1.0f);
     }
 
     void mouseDown (const juce::MouseEvent& event) override
     {
-        if (getWidth() <= 0)
+        if (getWidth() <= labelWidth || event.x < labelWidth)
             return;
 
         const int newIndex = juce::jlimit (0,
                                            (int) timeScales.size() - 1,
-                                           event.x * (int) timeScales.size() / getWidth());
+                                           (event.x - labelWidth) * (int) timeScales.size()
+                                               / (getWidth() - labelWidth));
         if (newIndex == selectedIndex)
             return;
 
@@ -1449,12 +2131,83 @@ public:
 private:
     juce::Rectangle<int> getSegmentBounds (int index) const
     {
-        const int left = index * getWidth() / (int) timeScales.size();
-        const int right = (index + 1) * getWidth() / (int) timeScales.size();
+        const int scaleWidth = juce::jmax (0, getWidth() - labelWidth);
+        const int left = labelWidth + index * scaleWidth / (int) timeScales.size();
+        const int right = labelWidth + (index + 1) * scaleWidth / (int) timeScales.size();
         return { left, 0, right - left, getHeight() };
     }
 
+    static constexpr int labelWidth = 72;
     static constexpr std::array<double, 5> timeScales { 1.0, 2.0, 4.0, 5.0, 10.0 };
+    int selectedIndex = 0;
+};
+
+class DetailViewSelector : public juce::Component
+{
+public:
+    DetailViewSelector()
+    {
+        setMouseCursor (juce::MouseCursor::PointingHandCursor);
+        setTitle ("Analysis View");
+    }
+
+    std::function<void(int)> onSelectionChanged;
+
+    void setSelectedIndex (int newIndex)
+    {
+        const int limitedIndex = juce::jlimit (0, 2, newIndex);
+        if (selectedIndex == limitedIndex)
+            return;
+
+        selectedIndex = limitedIndex;
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const juce::String labels[] { "Grid", "Sparklines", "Relational" };
+        for (int index = 0; index < 3; ++index)
+        {
+            const auto segment = getSegmentBounds (index);
+            if (index == selectedIndex)
+            {
+                g.setColour (kButtonTerracottaMuted);
+                g.fillRect ((float) segment.getX() + 3.0f,
+                            (float) segment.getBottom() - 3.5f,
+                            (float) segment.getWidth() - 6.0f,
+                            3.0f);
+            }
+
+            g.setColour (index == selectedIndex ? kTextPrimary
+                                                : kTextSecondary.withAlpha (0.92f));
+            g.setFont (makeUIFont (8.2f, index == selectedIndex));
+            g.drawText (labels[index], segment, juce::Justification::centred);
+        }
+    }
+
+    void mouseDown (const juce::MouseEvent& event) override
+    {
+        if (getWidth() <= 0)
+            return;
+
+        const int newIndex = juce::jlimit (0, 2, event.x * 3 / getWidth());
+        if (newIndex == selectedIndex)
+            return;
+
+        selectedIndex = newIndex;
+        repaint();
+        if (onSelectionChanged)
+            onSelectionChanged (selectedIndex);
+    }
+
+private:
+    juce::Rectangle<int> getSegmentBounds (int index) const
+    {
+        const int left = index * getWidth() / 3;
+        const int right = (index + 1) * getWidth() / 3;
+        return { left, 0, right - left, getHeight() };
+    }
+
     int selectedIndex = 0;
 };
 
@@ -1484,8 +2237,8 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     lookAndFeel = std::make_unique<MinimalPluginLookAndFeel>();
     setLookAndFeel (lookAndFeel.get());
 
-    setSize (860, 520);
-    spectrogramImage = juce::Image (juce::Image::RGB, 420, 220, true);
+    setSize (kEditorWidth, kEditorHeight);
+    spectrogramImage = juce::Image (juce::Image::ARGB, 420, 220, true);
     clearSpectrogramImage();
 
     startTimerHz (30);
@@ -1494,18 +2247,21 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     addAndMakeVisible (unfreezeButton);
     addAndMakeVisible (resetButton);
     addAndMakeVisible (bassBoostButton);
-    addAndMakeVisible (quarterToneButton);
     addAndMakeVisible (exportMidiButton);
-    addAndMakeVisible (manualModeButton);
-    addAndMakeVisible (autoModeButton);
     addAndMakeVisible (autoStartButton);
     addAndMakeVisible (autoStopButton);
     addAndMakeVisible (autoClearButton);
     addAndMakeVisible (detailAnalysisButton);
     addAndMakeVisible (topPeakCountSlider);
 
-    autoDetectionPad = std::make_unique<AutoDetectionXYPad>();
-    addAndMakeVisible (*autoDetectionPad);
+    captureModeSelector = std::make_unique<CaptureModeSelector>();
+    addAndMakeVisible (*captureModeSelector);
+
+    tuningSelector = std::make_unique<TuningSelector>();
+    addAndMakeVisible (*tuningSelector);
+
+    sensitivityControl = std::make_unique<SensitivityControl>();
+    addAndMakeVisible (*sensitivityControl);
 
     staffComponent = std::make_unique<FrozenChordStaffComponent>();
     addAndMakeVisible (*staffComponent);
@@ -1519,29 +2275,81 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     addAndMakeVisible (*midiTimeScaleSelector);
     midiTimeScaleSelector->setVisible (false);
 
+    detailViewSelector = std::make_unique<DetailViewSelector>();
+    addAndMakeVisible (*detailViewSelector);
+    detailViewSelector->setVisible (false);
+
     styleTextButton (freezeButton, true);
     styleTextButton (unfreezeButton);
     styleTextButton (resetButton);
     styleTextButton (bassBoostButton);
-    styleTextButton (quarterToneButton);
     styleTextButton (exportMidiButton);
-    styleTextButton (manualModeButton);
-    styleTextButton (autoModeButton);
     styleTextButton (autoStartButton, true);
     styleTextButton (autoStopButton);
     styleTextButton (autoClearButton);
     styleTextButton (detailAnalysisButton);
 
-    manualModeButton.setClickingTogglesState (true);
-    autoModeButton.setClickingTogglesState (true);
-    manualModeButton.onClick = [this]() { setAutoPageActive (false); };
-    autoModeButton.onClick = [this]() { setAutoPageActive (true); };
+    for (auto* button : { &freezeButton,
+                          &unfreezeButton,
+                          &resetButton,
+                          &exportMidiButton,
+                          &autoStartButton,
+                          &autoStopButton,
+                          &autoClearButton,
+                          &bassBoostButton,
+                          &detailAnalysisButton })
+        button->getProperties().set (juce::Identifier ("largeButtonText"), true);
+
+    for (auto* button : { &freezeButton,
+                          &unfreezeButton,
+                          &resetButton,
+                          &exportMidiButton,
+                          &autoStartButton,
+                          &autoStopButton,
+                          &autoClearButton })
+        button->getProperties().set (juce::Identifier ("fontSizeOffset"), 2.0);
+
+    for (auto* button : { &bassBoostButton,
+                          &detailAnalysisButton })
+        button->getProperties().set (juce::Identifier ("backgroundOpacity"), 0.71);
+
+    detailAnalysisButton.getProperties().set (juce::Identifier ("textTab"), true);
+    bassBoostButton.getProperties().set (juce::Identifier ("parameterToggle"), true);
+    autoStartButton.getProperties().set (juce::Identifier ("primaryAction"), true);
+    freezeButton.getProperties().set (juce::Identifier ("primaryAction"), true);
+    for (auto* button : { &autoStopButton, &autoClearButton, &unfreezeButton, &resetButton })
+        button->getProperties().set (juce::Identifier ("secondaryAction"), true);
+    exportMidiButton.getProperties().set (juce::Identifier ("outlineAction"), true);
+
+    autoStartButton.setButtonText ("START");
+    freezeButton.setButtonText ("FREEZE");
+
+    captureModeSelector->onSelectionChanged = [this] (int selectedIndex)
+    {
+        setCaptureMode (selectedIndex == 0 ? CaptureMode::Auto : CaptureMode::Manual);
+    };
+
+    tuningSelector->onQuarterToneChanged = [this] (bool shouldUseQuarterTone)
+    {
+        quarterToneMode = shouldUseQuarterTone;
+        repaint();
+    };
 
     autoStartButton.onClick = [this]()
     {
+        if (isAutoRunning)
+        {
+            const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
+            finishAutoAnalysis (nowSeconds, "Auto stopped.", false);
+            return;
+        }
+
         isDetailPageActive = false;
         isAutoRunning = true;
         autoStartWallTimeSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
+        previousHostTransportPlaying = processorRef.hasHostTransportState()
+                                         && processorRef.getHostTransportPlaying();
+        hasObservedHostPlaybackSinceAutoStart = previousHostTransportPlaying;
         detailAnalysisHistory.clear();
         hasCompletedAutoAnalysis = false;
         resetAutoDetectorState();
@@ -1550,12 +2358,6 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
         refreshExportButtonState();
         showTransientStatusMessage ("Auto listening for onsets.");
         repaint();
-    };
-
-    autoStopButton.onClick = [this]()
-    {
-        const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
-        finishAutoAnalysis (nowSeconds, "Auto stopped.", false);
     };
 
     autoClearButton.onClick = [this]()
@@ -1586,16 +2388,35 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
         if (midiTimeScaleSelector != nullptr)
             midiTimeScaleSelector->setVisible (isDetailPageActive);
 
+        if (detailViewSelector != nullptr)
+            detailViewSelector->setVisible (isDetailPageActive);
+        resized();
+
         repaint();
     };
+
+    const auto selectDetailView = [this] (DetailViewMode mode)
+    {
+        detailViewMode = mode;
+        if (detailViewSelector != nullptr)
+            detailViewSelector->setSelectedIndex ((int) mode);
+        analysisHoverTarget = -1;
+        repaint();
+    };
+
+    detailViewSelector->onSelectionChanged = [selectDetailView] (int selectedIndex)
+    {
+        selectDetailView ((DetailViewMode) juce::jlimit (0, 2, selectedIndex));
+    };
+    selectDetailView (DetailViewMode::grid);
 
     topPeakCountSlider.setRange (1.0, (double) kNumNoisyPeaks, 1.0);
     topPeakCountSlider.setValue ((double) kNumNoisyPeaks, juce::dontSendNotification);
     topPeakCountSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    topPeakCountSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 30, 16);
+    topPeakCountSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 36, 19);
     topPeakCountSlider.setColour (juce::Slider::trackColourId, kButtonTerracotta);
     topPeakCountSlider.setColour (juce::Slider::thumbColourId, kButtonTerracottaStrong);
-    topPeakCountSlider.setColour (juce::Slider::backgroundColourId, kPanelTint.withMultipliedAlpha (0.35f));
+    topPeakCountSlider.setColour (juce::Slider::backgroundColourId, kPanelTint.withAlpha (0.63f));
     topPeakCountSlider.setColour (juce::Slider::textBoxTextColourId, kTextPrimary);
     topPeakCountSlider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
     topPeakCountSlider.onValueChange = [this]()
@@ -1622,12 +2443,6 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
         repaint();
     };
 
-    quarterToneButton.setClickingTogglesState (true);
-    quarterToneButton.onClick = [this]()
-    {
-        repaint();
-    };
-
 freezeButton.onClick = [this]()
 {
     const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
@@ -1644,10 +2459,12 @@ freezeButton.onClick = [this]()
 
     // enter freeze mode
     isFrozen = true;
+    freezeButton.setToggleState (true, juce::dontSendNotification);
 
     spectrumForDrawing = latestSpectrum;
     topFreqsForDrawing = latestTopFreqs;
     topMagsForDrawing  = latestTopMags;
+    topPeakLevelsDbFsForDrawing = latestTopPeakLevelsDbFs;
 
     pendingFreezeMarker = true;
     pushSpectrumToImage();
@@ -1662,6 +2479,7 @@ unfreezeButton.onClick = [this]()
 {
     closeActiveFrozenChord();
     isFrozen = false;
+    freezeButton.setToggleState (false, juce::dontSendNotification);
     processorRef.clearLiveFrozenMidiChord();
     repaint();
 };
@@ -1674,10 +2492,21 @@ unfreezeButton.onClick = [this]()
     exportMidiButton.onClick = [this]()
     {
         juce::PopupMenu exportMenu;
-        exportMenu.addItem (1, "MIDI (.mid)");
-        exportMenu.addItem (2, "MusicXML (.musicxml)");
+        exportMenu.setLookAndFeel (lookAndFeel.get());
+        exportMenu.addItem (1, "MIDI");
+        exportMenu.addItem (2, "MusicXML");
 
-        exportMenu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (exportMidiButton),
+        auto exportAnchor = exportMidiButton.getScreenBounds();
+        exportAnchor.setX (exportAnchor.getCentreX());
+        exportAnchor.setWidth (1);
+
+        exportMenu.showMenuAsync (juce::PopupMenu::Options()
+                                      .withTargetComponent (exportMidiButton)
+                                      .withTargetScreenArea (exportAnchor)
+                                      .withPreferredPopupDirection (
+                                          juce::PopupMenu::Options::PopupDirection::downwards)
+                                      .withMinimumWidth (112)
+                                      .withStandardItemHeight (24),
                                   [this] (int result)
                                   {
                                       if (result == 0)
@@ -1731,7 +2560,7 @@ unfreezeButton.onClick = [this]()
     };
 
     refreshExportButtonState();
-    refreshModeButtonStates();
+    refreshCaptureModeControls();
     refreshAutoButtonStates();
     refreshDetailAnalysisButtonState();
     bassBoostButton.toFront (false);
@@ -1746,7 +2575,12 @@ AudioPluginAudioProcessorEditor::~AudioPluginAudioProcessorEditor()
 
 bool AudioPluginAudioProcessorEditor::useQuarterToneMode() const
 {
-    return quarterToneButton.getToggleState();
+    return quarterToneMode;
+}
+
+bool AudioPluginAudioProcessorEditor::isAutoMode() const noexcept
+{
+    return currentMode == CaptureMode::Auto;
 }
 
 int AudioPluginAudioProcessorEditor::getActivePeakCount() const
@@ -1783,45 +2617,55 @@ juce::String AudioPluginAudioProcessorEditor::getCurrentHostTimeLabel() const
     return "local " + formatTimeLabel (activeFreezeSessionOffsetSeconds);
 }
 
-void AudioPluginAudioProcessorEditor::setAutoPageActive (bool shouldUseAutoPage)
+void AudioPluginAudioProcessorEditor::setCaptureMode (CaptureMode mode)
 {
-    if (! shouldUseAutoPage && isAutoRunning)
+    if (mode == currentMode)
+        return;
+
+    if (mode == CaptureMode::Manual && isAutoRunning)
     {
         const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
         finishAutoAnalysis (nowSeconds, "Auto stopped.", true);
     }
 
-    isAutoPageActive = shouldUseAutoPage;
+    currentMode = mode;
     isDetailPageActive = false;
-    refreshModeButtonStates();
+    refreshCaptureModeControls();
     refreshDetailAnalysisButtonState();
     refreshStaffComponent();
     resized();
     repaint();
 }
 
-void AudioPluginAudioProcessorEditor::refreshModeButtonStates()
+void AudioPluginAudioProcessorEditor::refreshCaptureModeControls()
 {
-    manualModeButton.setToggleState (! isAutoPageActive, juce::dontSendNotification);
-    autoModeButton.setToggleState (isAutoPageActive, juce::dontSendNotification);
+    const bool autoMode = isAutoMode();
 
-    freezeButton.setVisible (! isAutoPageActive);
-    unfreezeButton.setVisible (! isAutoPageActive);
-    resetButton.setVisible (! isAutoPageActive);
-    quarterToneButton.setVisible (true);
+    if (captureModeSelector != nullptr)
+        captureModeSelector->setSelectedIndex (autoMode ? 0 : 1);
+    if (tuningSelector != nullptr)
+    {
+        tuningSelector->setQuarterToneEnabled (quarterToneMode);
+        tuningSelector->setVisible (true);
+    }
+
+    freezeButton.setVisible (! autoMode);
+    unfreezeButton.setVisible (! autoMode);
+    resetButton.setVisible (! autoMode);
     exportMidiButton.setVisible (true);
 
-    autoStartButton.setVisible (isAutoPageActive);
-    autoStopButton.setVisible (isAutoPageActive);
-    autoClearButton.setVisible (isAutoPageActive);
-    if (autoDetectionPad != nullptr)
-        autoDetectionPad->setVisible (isAutoPageActive);
+    autoStartButton.setVisible (autoMode);
+    autoStopButton.setVisible (false);
+    autoClearButton.setVisible (autoMode);
+    if (sensitivityControl != nullptr)
+        sensitivityControl->setVisible (autoMode);
 }
 
 void AudioPluginAudioProcessorEditor::refreshAutoButtonStates()
 {
-    autoStartButton.setEnabled (! isAutoRunning);
-    autoStopButton.setEnabled (isAutoRunning);
+    autoStartButton.setToggleState (isAutoRunning, juce::dontSendNotification);
+    autoStartButton.setButtonText (isAutoRunning ? "STOP" : "START");
+    autoStartButton.setEnabled (true);
     autoClearButton.setEnabled (! frozenChords.empty() || autoCaptureCount > 0);
 }
 
@@ -1880,34 +2724,82 @@ DetailAnalysisFrame AudioPluginAudioProcessorEditor::calculateDetailAnalysisFram
     const int maxBin = numBins - 1;
 
     double logMagnitudeSum = 0.0;
-    double magnitudeSum = 0.0;
-    double weightedFrequencySum = 0.0;
+    double fullMagnitudeSum = 0.0;
     int magnitudeCount = 0;
+    float peakSpectrumDb = -120.0f;
     std::array<float, kFftSize / 2> normalisedSpectrum {};
 
     for (int bin = minBin; bin <= maxBin; ++bin)
     {
-        const float db = juce::jlimit (-120.0f, 24.0f, latestSpectrum[(size_t) bin]);
+        // Keep the lower numerical floor, but do not clamp the upper FFT
+        // magnitude. The FFT output is not dBFS-normalised and can exceed
+        // +24 dB without representing an invalid audio level.
+        const float db = juce::jmax (-120.0f, latestSpectrum[(size_t) bin]);
         const double magnitude = juce::jmax (1.0e-12, std::pow (10.0, (double) db / 20.0));
-        const double hz = (double) bin * sampleRate / (double) kFftSize;
 
         normalisedSpectrum[(size_t) bin] = (float) magnitude;
         logMagnitudeSum += std::log (magnitude);
-        magnitudeSum += magnitude;
-        weightedFrequencySum += hz * magnitude;
+        fullMagnitudeSum += magnitude;
+        peakSpectrumDb = juce::jmax (peakSpectrumDb, db);
         ++magnitudeCount;
     }
 
-    if (magnitudeCount > 0 && magnitudeSum > 1.0e-12)
+    if (magnitudeCount > 0 && fullMagnitudeSum > 1.0e-12)
     {
         const double geometricMean = std::exp (logMagnitudeSum / (double) magnitudeCount);
-        const double arithmeticMean = magnitudeSum / (double) magnitudeCount;
+        const double arithmeticMean = fullMagnitudeSum / (double) magnitudeCount;
         frame.spectralFlatness = (float) juce::jlimit (0.0, 1.0, geometricMean / arithmeticMean);
-        frame.centroidHz = (float) juce::jlimit (0.0, (double) sampleRate * 0.5,
-                                                weightedFrequencySum / magnitudeSum);
+
+        // Very low-level Hann-window sidelobes can sit far away from a tonal
+        // peak. In a second central moment, their large squared distance can
+        // otherwise inflate the spread even though they are inaudibly weak.
+        // Apply the same peak-relative gate to both centroid and spread so
+        // that they remain moments of the same magnitude distribution.
+        constexpr float descriptorDynamicRangeDb = 60.0f;
+        const float descriptorFloorDb = juce::jmax (-120.0f,
+                                                     peakSpectrumDb - descriptorDynamicRangeDb);
+        double descriptorMagnitudeSum = 0.0;
+        double weightedFrequencySum = 0.0;
+
+        for (int bin = minBin; bin <= maxBin; ++bin)
+        {
+            const float db = juce::jmax (-120.0f, latestSpectrum[(size_t) bin]);
+            if (db <= descriptorFloorDb)
+                continue;
+
+            const double magnitude = (double) normalisedSpectrum[(size_t) bin];
+            const double hz = (double) bin * sampleRate / (double) kFftSize;
+            descriptorMagnitudeSum += magnitude;
+            weightedFrequencySum += hz * magnitude;
+        }
+
+        if (descriptorMagnitudeSum > 1.0e-12)
+        {
+            frame.centroidHz = (float) juce::jlimit (0.0, (double) sampleRate * 0.5,
+                                                    weightedFrequencySum / descriptorMagnitudeSum);
+
+            // Spectral spread is the magnitude-weighted standard deviation
+            // around the gated centroid and remains expressed in hertz.
+            double weightedSquaredDeviation = 0.0;
+            for (int bin = minBin; bin <= maxBin; ++bin)
+            {
+                const float db = juce::jmax (-120.0f, latestSpectrum[(size_t) bin]);
+                if (db <= descriptorFloorDb)
+                    continue;
+
+                const double hz = (double) bin * sampleRate / (double) kFftSize;
+                const double distanceFromCentroid = hz - (double) frame.centroidHz;
+                weightedSquaredDeviation += (double) normalisedSpectrum[(size_t) bin]
+                                          * distanceFromCentroid
+                                          * distanceFromCentroid;
+            }
+
+            frame.spectralSpreadHz = (float) std::sqrt (weightedSquaredDeviation
+                                                        / descriptorMagnitudeSum);
+        }
     }
 
-    if (magnitudeSum > 1.0e-12)
+    if (fullMagnitudeSum > 1.0e-12)
     {
         // L1-normalise each spectrum so flux describes spectral-shape motion
         // rather than duplicating the RMS level. Half-wave rectification keeps
@@ -1916,7 +2808,7 @@ DetailAnalysisFrame AudioPluginAudioProcessorEditor::calculateDetailAnalysisFram
         for (int bin = minBin; bin <= maxBin; ++bin)
         {
             const float currentMagnitude = normalisedSpectrum[(size_t) bin]
-                                         / (float) magnitudeSum;
+                                         / (float) fullMagnitudeSum;
             normalisedSpectrum[(size_t) bin] = currentMagnitude;
 
             if (hasPreviousDetailSpectrum)
@@ -2006,6 +2898,15 @@ void AudioPluginAudioProcessorEditor::refreshDetailAnalysisButtonState()
 
     if (midiTimeScaleSelector != nullptr)
         midiTimeScaleSelector->setVisible (isDetailPageActive && canOpenDetail);
+
+    bassBoostButton.setVisible (! isDetailPageActive);
+
+    if (detailViewSelector != nullptr)
+    {
+        detailViewSelector->setEnabled (canOpenDetail);
+        detailViewSelector->setVisible (isDetailPageActive && canOpenDetail);
+        detailViewSelector->setSelectedIndex ((int) detailViewMode);
+    }
 }
 
 void AudioPluginAudioProcessorEditor::captureAutoChord (double nowSeconds)
@@ -2032,6 +2933,10 @@ void AudioPluginAudioProcessorEditor::captureAutoChord (double nowSeconds)
     const int activePeakCount = getActivePeakCount();
     for (int i = 0; i < activePeakCount; ++i)
         snapshot.freqsHz[(size_t) i] = topFreqsForDrawing[(size_t) i];
+    snapshot.partialIntensities = calculatePartialIntensities (
+        snapshot.freqsHz,
+        topPeakLevelsDbFsForDrawing,
+        activePeakCount);
 
     snapshot.useQuarterToneMode = useQuarterToneMode();
     snapshot.startTimeSeconds = startTimeSeconds;
@@ -2043,7 +2948,9 @@ void AudioPluginAudioProcessorEditor::captureAutoChord (double nowSeconds)
     snapshot.label = "Auto " + juce::String (autoCaptureCount);
 
     frozenChords.push_back (snapshot);
-    processorRef.setLiveFrozenMidiChord (snapshot.freqsHz, snapshot.useQuarterToneMode);
+    processorRef.setLiveFrozenMidiChord (snapshot.freqsHz,
+                                         snapshot.partialIntensities,
+                                         snapshot.useQuarterToneMode);
     pendingFreezeMarker = true;
 
     refreshStaffComponent();
@@ -2052,7 +2959,7 @@ void AudioPluginAudioProcessorEditor::captureAutoChord (double nowSeconds)
 
 void AudioPluginAudioProcessorEditor::processAutoOnsetDetection (double nowSeconds)
 {
-    if (! isAutoPageActive || ! isAutoRunning)
+    if (! isAutoMode() || ! isAutoRunning)
         return;
 
     const double elapsedSeconds = nowSeconds - autoStartWallTimeSeconds;
@@ -2125,8 +3032,8 @@ void AudioPluginAudioProcessorEditor::processAutoOnsetDetection (double nowSecon
             autoFluxDeviation = 0.985f * autoFluxDeviation
                               + 0.015f * std::abs (autoOnsetStrength - previousMean);
 
-            const float sensitivity = autoDetectionPad != nullptr
-                                        ? autoDetectionPad->getSensitivity()
+            const float sensitivity = sensitivityControl != nullptr
+                                        ? sensitivityControl->getSensitivity()
                                         : 6.0f;
             const float thresholdScale = juce::jmap (sensitivity, 1.0f, 8.0f, 3.2f, 1.1f);
             threshold = autoFluxMean + thresholdScale * juce::jmax (0.18f, autoFluxDeviation);
@@ -2137,9 +3044,9 @@ void AudioPluginAudioProcessorEditor::processAutoOnsetDetection (double nowSecon
     previousAutoResidual = latestResidual;
     hasPreviousAutoResidual = true;
 
-    const double minGapSeconds = (autoDetectionPad != nullptr
-                                    ? autoDetectionPad->getMinGapMs()
-                                    : 400.0) * 0.001;
+    const double minGapSeconds = (sensitivityControl != nullptr
+                                    ? sensitivityControl->getMinGapMs()
+                                    : kAutoMinimumGapMs) * 0.001;
     const bool outsideRefractory = (nowSeconds - lastAutoOnsetWallTimeSeconds) >= minGapSeconds;
 
     if (outsideRefractory && (spectralOnsetDetected || significantLevelRise))
@@ -2154,9 +3061,7 @@ void AudioPluginAudioProcessorEditor::processAutoOnsetDetection (double nowSecon
 
 void AudioPluginAudioProcessorEditor::refreshBassBoostButtonText()
 {
-    bassBoostButton.setButtonText (bassBoostButton.getToggleState()
-                                     ? "Bass Boost: On"
-                                     : "Bass Boost: Off");
+    bassBoostButton.setButtonText ("Bass Boost");
 }
 
 void AudioPluginAudioProcessorEditor::captureFrozenChord()
@@ -2166,6 +3071,7 @@ void AudioPluginAudioProcessorEditor::captureFrozenChord()
     if ((int) frozenChords.size() >= kMaxManualFrozenChords)
     {
         isFrozen = false;
+        freezeButton.setToggleState (false, juce::dontSendNotification);
         processorRef.clearLiveFrozenMidiChord();
         showTransientStatusMessage (juce::String (kMaxManualFrozenChords)
                                       + " chords max reached. Press Reset to start a new score.");
@@ -2181,6 +3087,10 @@ void AudioPluginAudioProcessorEditor::captureFrozenChord()
     const int activePeakCount = getActivePeakCount();
     for (int i = 0; i < activePeakCount; ++i)
         snapshot.freqsHz[(size_t) i] = topFreqsForDrawing[(size_t) i];
+    snapshot.partialIntensities = calculatePartialIntensities (
+        snapshot.freqsHz,
+        topPeakLevelsDbFsForDrawing,
+        activePeakCount);
 
     snapshot.useQuarterToneMode = useQuarterToneMode();
     snapshot.startTimeSeconds = activeFreezeSessionOffsetSeconds
@@ -2192,7 +3102,9 @@ void AudioPluginAudioProcessorEditor::captureFrozenChord()
     snapshot.label = "Freeze " + juce::String (freezeCaptureCount);
 
     frozenChords.push_back (snapshot);
-    processorRef.setLiveFrozenMidiChord (snapshot.freqsHz, snapshot.useQuarterToneMode);
+    processorRef.setLiveFrozenMidiChord (snapshot.freqsHz,
+                                         snapshot.partialIntensities,
+                                         snapshot.useQuarterToneMode);
 
     refreshStaffComponent();
 }
@@ -2235,6 +3147,7 @@ void AudioPluginAudioProcessorEditor::resetFrozenState()
 {
     closeActiveFrozenChord();
     isFrozen = false;
+    freezeButton.setToggleState (false, juce::dontSendNotification);
     isAutoRunning = false;
     isDetailPageActive = false;
     hasCompletedAutoAnalysis = false;
@@ -2254,11 +3167,13 @@ void AudioPluginAudioProcessorEditor::resetFrozenState()
     spectrumForDrawing.fill (0.0f);
     topFreqsForDrawing.fill (0.0f);
     topMagsForDrawing.fill (0.0f);
+    topPeakLevelsDbFsForDrawing.fill (-120.0f);
     latestSpectrum.fill (0.0f);
     latestResidual.fill (0.0f);
     previousAutoResidual.fill (0.0f);
     latestTopFreqs.fill (0.0f);
     latestTopMags.fill (0.0f);
+    latestTopPeakLevelsDbFs.fill (-120.0f);
 
     clearSpectrogramImage();
     resetAutoDetectorState();
@@ -2272,7 +3187,7 @@ void AudioPluginAudioProcessorEditor::resetFrozenState()
 
 void AudioPluginAudioProcessorEditor::clearSpectrogramImage()
 {
-    spectrogramImage.clear (spectrogramImage.getBounds(), kSpectrogramBase);
+    spectrogramImage.clear (spectrogramImage.getBounds(), juce::Colours::transparentBlack);
 }
 
 void AudioPluginAudioProcessorEditor::drawAnalysisCurve (juce::Graphics& g,
@@ -2284,33 +3199,27 @@ void AudioPluginAudioProcessorEditor::drawAnalysisCurve (juce::Graphics& g,
                                                          bool available,
                                                          const std::function<float (const DetailAnalysisFrame&)>& valueForFrame)
 {
-    auto panel = area.toFloat();
-    g.setColour (kPanelTint.withMultipliedAlpha (available ? 0.22f : 0.10f));
-    g.fillRoundedRectangle (panel, 12.0f);
-    g.setColour (kTextPrimary.withAlpha (available ? 0.22f : 0.10f));
-    g.drawRoundedRectangle (panel.reduced (0.5f), 12.0f, 1.0f);
+    auto descriptorArea = area.reduced (2, 0);
+    auto header = descriptorArea.removeFromTop (28);
+    auto labelArea = header.removeFromLeft ((int) std::round ((float) area.getWidth() * 0.60f));
 
-    auto header = area.reduced (10, 8).removeFromTop (18);
-    g.setFont (makeUIFont (9.0f, true));
-    g.setColour (available ? kTextPrimary : kTextSecondary.withAlpha (0.45f));
-    g.drawText (title, header, juce::Justification::centredLeft);
+    g.setFont (makeUIFont (10.8f, false));
+    g.setColour (available ? kContrastBlush : kContrastBlush.withAlpha (0.38f));
+    g.drawFittedText (title, labelArea, juce::Justification::centredLeft, 1);
 
-    g.setFont (makeUIFont (7.6f, false));
+    g.setColour (available ? kTextPrimary : kTextSecondary.withAlpha (0.48f));
+    g.setFont (makeUIFont (11.8f, false));
     g.drawText (available ? valueText : "Unavailable",
                 header,
                 juce::Justification::centredRight);
 
-    auto graph = area.reduced (12, 10);
-    graph.removeFromTop (24);
+    descriptorArea.removeFromTop (14);
+    auto graph = descriptorArea.removeFromTop (juce::jmin (50, descriptorArea.getHeight())).reduced (8, 0);
 
-    g.setColour (kTextPrimary.withAlpha (0.10f));
-    for (int i = 1; i < 4; ++i)
-    {
-        const auto y = graph.getY() + graph.getHeight() * i / 4;
-        g.drawHorizontalLine (y, (float) graph.getX(), (float) graph.getRight());
-    }
+    g.setColour (juce::Colours::black.withAlpha (0.08f));
+    g.drawHorizontalLine (graph.getCentreY(), (float) graph.getX(), (float) graph.getRight());
 
-    if (! available || detailAnalysisHistory.size() < 2 || maxValue <= minValue)
+    if (! available || graph.isEmpty() || detailAnalysisHistory.size() < 2 || maxValue <= minValue)
         return;
 
     juce::Path curve;
@@ -2329,40 +3238,636 @@ void AudioPluginAudioProcessorEditor::drawAnalysisCurve (juce::Graphics& g,
             curve.lineTo (x, y);
     }
 
-    g.setColour (kButtonTerracottaStrong.withAlpha (0.92f));
-    g.strokePath (curve, juce::PathStrokeType (1.7f));
+    g.setColour (kButtonTerracottaMuted);
+    g.strokePath (curve,
+                  juce::PathStrokeType (1.5f,
+                                        juce::PathStrokeType::curved,
+                                        juce::PathStrokeType::rounded));
+}
+
+juce::Rectangle<float> AudioPluginAudioProcessorEditor::getAlternateAnalysisBounds() const
+{
+    auto bounds = getModuleBounds (getLocalBounds());
+    bounds.removeFromRight (kRightPanelWidth);
+    bounds.removeFromRight (kMainColumnGap);
+    bounds.translate (-kLeftColumnShift, 0);
+
+    bounds.removeFromTop (getExpandedSpectrogramHeight (bounds.getHeight()));
+    bounds.removeFromTop (kSpectrogramBottomGap);
+    if (! isDetailPageActive)
+        bounds = shrinkScoreArea (bounds);
+
+    return bounds.reduced (8, 6).reduced (24, 42).toFloat();
+}
+
+juce::Rectangle<float> AudioPluginAudioProcessorEditor::getSpectrogramGraphBounds() const
+{
+    auto bounds = getModuleBounds (getLocalBounds());
+    bounds.removeFromRight (kRightPanelWidth);
+    bounds.removeFromRight (kMainColumnGap);
+    auto leftPanel = bounds.translated (-kLeftColumnShift, 0);
+
+    auto spectroArea = leftPanel.removeFromTop (getExpandedSpectrogramHeight (leftPanel.getHeight()));
+    return spectroArea.reduced (8, 6).reduced (8).toFloat();
+}
+
+void AudioPluginAudioProcessorEditor::mouseMove (const juce::MouseEvent& event)
+{
+    const auto spectrogramGraph = getSpectrogramGraphBounds();
+    const bool wasSpectrogramHoverActive = spectrogramHoverActive;
+    const float previousHoverFrequencyHz = spectrogramHoverFrequencyHz;
+
+    if (spectrogramGraph.contains (event.position) && processorRef.getSampleRate() > 0.0)
+    {
+        const float nyquist = (float) processorRef.getSampleRate() * 0.5f;
+        const float minFreq = kMinDisplayFreq;
+        const float maxFreq = juce::jmin (kMaxDisplayFreq, nyquist);
+        const float normalisedY = juce::jlimit (0.0f, 1.0f,
+                                                (spectrogramGraph.getBottom() - event.position.y)
+                                                    / spectrogramGraph.getHeight());
+
+        spectrogramHoverFrequencyHz = melToHz (hzToMel (minFreq)
+                                                + normalisedY * (hzToMel (maxFreq) - hzToMel (minFreq)));
+        spectrogramHoverActive = true;
+    }
+    else
+    {
+        spectrogramHoverActive = false;
+    }
+
+    if (spectrogramHoverActive != wasSpectrogramHoverActive
+        || (spectrogramHoverActive
+            && std::abs (spectrogramHoverFrequencyHz - previousHoverFrequencyHz) > 1.0f))
+        repaint (spectrogramGraph.getSmallestIntegerContainer().expanded (2));
+
+    const auto clearAnalysisHover = [this]() {
+        if (analysisHoverTarget >= 0)
+        {
+            analysisHoverTarget = -1;
+            repaint();
+        }
+    };
+
+    if (! isDetailPageActive || detailViewMode == DetailViewMode::grid || detailAnalysisHistory.size() < 2)
+    {
+        clearAnalysisHover();
+        return;
+    }
+
+    const auto content = getAlternateAnalysisBounds();
+    const auto mouse = event.position;
+    if (! content.contains (mouse))
+    {
+        clearAnalysisHover();
+        return;
+    }
+
+    const auto count = detailAnalysisHistory.size();
+
+    if (detailViewMode == DetailViewMode::sparklines)
+    {
+        const float rowHeight = content.getHeight() / 6.0f;
+        const int row = juce::jlimit (0, 5, (int) ((mouse.y - content.getY()) / rowHeight));
+        auto graph = juce::Rectangle<float> (content.getX(), content.getY() + rowHeight * (float) row,
+                                             content.getWidth(), rowHeight)
+                         .reduced (0.0f, 6.0f);
+        graph.removeFromLeft (92.0f);
+        graph.removeFromRight (72.0f);
+        graph = graph.withSizeKeepingCentre (graph.getWidth() * 0.52f, graph.getHeight());
+
+        if (! graph.contains (mouse))
+        {
+            clearAnalysisHover();
+            return;
+        }
+
+        const float unitTime = juce::jlimit (0.0f, 1.0f, (mouse.x - graph.getX()) / graph.getWidth());
+        const size_t index = juce::jlimit ((size_t)0, count - 1, (size_t) std::round (unitTime * (float) (count - 1)));
+        const auto& frame = detailAnalysisHistory[index];
+        float normalised = 0.0f;
+
+        switch (row)
+        {
+        case 0:
+        {
+            const float hz = juce::jlimit (80.0f, 12000.0f, frame.centroidHz);
+            normalised = std::log (hz / 80.0f) / std::log (12000.0f / 80.0f);
+            break;
+        }
+        case 1:
+            normalised = (juce::jlimit (-96.0f, 0.0f, frame.rmsDb) + 96.0f) / 96.0f;
+            break;
+        case 2:
+            normalised = juce::jlimit (0.0f, 1.0f, frame.spectralFlux);
+            break;
+        case 3:
+            normalised = juce::jlimit (0.0f, 1.0f, frame.spectralSpreadHz / 12000.0f);
+            break;
+        case 4:
+            normalised = juce::jlimit (0.0f, 1.0f, frame.spectralFlatness);
+            break;
+        case 5:
+            normalised = 0.5f * (juce::jlimit (-1.0f, 1.0f, frame.stereoPanEnergy) + 1.0f);
+            break;
+        default:
+            break;
+        }
+
+        analysisHoverTarget = row;
+        analysisHoverFrameIndex = index;
+        analysisHoverPoint = { graph.getX() + unitTime * graph.getWidth(),
+                               graph.getBottom() - normalised * graph.getHeight() };
+        repaint();
+        return;
+    }
+
+    constexpr float panelGap = 24.0f;
+    const float panelWidth = (content.getWidth() - panelGap) * 0.5f;
+    const juce::Rectangle<float> panels[] = { { content.getX(), content.getY(), panelWidth, content.getHeight() },
+                                              { content.getX() + panelWidth + panelGap, content.getY(), panelWidth,
+                                                content.getHeight() } };
+
+    float nearestDistance = std::numeric_limits<float>::max();
+    int nearestTarget = -1;
+    size_t nearestIndex = 0;
+    juce::Point<float> nearestPoint;
+
+    for (int panelIndex = 0; panelIndex < 2; ++panelIndex)
+    {
+        auto graph = panels[panelIndex].reduced (22.0f, 18.0f);
+        graph.removeFromTop (28.0f);
+        graph.removeFromBottom (18.0f);
+        graph.removeFromLeft (16.0f);
+
+        if (! graph.expanded (12.0f).contains (mouse))
+            continue;
+
+        const auto maxDrawablePoints = juce::jmax (2, (int) graph.getWidth() * 2);
+        const auto step = juce::jmax ((size_t)1, count / (size_t) maxDrawablePoints);
+
+        for (size_t index = 0; index < count; index += step)
+        {
+            const auto& frame = detailAnalysisHistory[index];
+            if (panelIndex == 1 && ! frame.stereoPanAvailable)
+                continue;
+
+            const float xValue = panelIndex == 0 ? (juce::jlimit (-96.0f, 0.0f, frame.rmsDb) + 96.0f) / 96.0f
+                                                 : juce::jlimit (0.0f, 1.0f, frame.spectralSpreadHz / 12000.0f);
+            const float yValue = panelIndex == 0 ? juce::jlimit (0.0f, 1.0f, frame.spectralFlux)
+                                                 : 0.5f * (juce::jlimit (-1.0f, 1.0f, frame.stereoPanEnergy) + 1.0f);
+            const juce::Point<float> point{ graph.getX() + xValue * graph.getWidth(),
+                                            graph.getBottom() - yValue * graph.getHeight() };
+            const float distance = mouse.getDistanceFrom (point);
+            if (distance < nearestDistance)
+            {
+                nearestDistance = distance;
+                nearestTarget = 6 + panelIndex;
+                nearestIndex = index;
+                nearestPoint = point;
+            }
+        }
+    }
+
+    if (nearestTarget >= 0 && nearestDistance <= 18.0f)
+    {
+        analysisHoverTarget = nearestTarget;
+        analysisHoverFrameIndex = nearestIndex;
+        analysisHoverPoint = nearestPoint;
+        repaint();
+    }
+    else
+    {
+        clearAnalysisHover();
+    }
+
+    return;
+}
+
+void AudioPluginAudioProcessorEditor::mouseExit (const juce::MouseEvent&)
+{
+    const bool hadSpectrogramHover = spectrogramHoverActive;
+    spectrogramHoverActive = false;
+
+    if (analysisHoverTarget >= 0)
+    {
+        analysisHoverTarget = -1;
+        repaint();
+    }
+    else if (hadSpectrogramHover)
+    {
+        repaint (getSpectrogramGraphBounds().getSmallestIntegerContainer().expanded (2));
+    }
+}
+
+void AudioPluginAudioProcessorEditor::drawSparklineAnalysisPanel (juce::Graphics& g, juce::Rectangle<int> area)
+{
+    auto panel = area.reduced (8, 6);
+    g.setColour (kPanelUnderlayColour);
+    g.fillRoundedRectangle (panel.toFloat().expanded (2.0f), kUnifiedCornerRadius);
+    g.setColour (kLargePanelColour);
+    g.fillRoundedRectangle (panel.toFloat(), kUnifiedCornerRadius);
+
+    auto header = panel.reduced (14, 10).removeFromTop (kDetailHeaderHeight);
+    header.removeFromRight (kDetailDragWidth);
+    header.removeFromRight (12);
+    header.removeFromRight (kDetailTimeScaleWidth);
+    header.removeFromRight (14);
+
+    auto titleArea = header.removeFromLeft (128);
+    header.removeFromLeft (12);
+    g.setColour (kContrastBlush);
+    g.setFont (makeUIFont (11.8f, true));
+    g.drawText ("Sparklines", titleArea, juce::Justification::centredLeft);
+
+    g.setColour (kTextSecondary.withAlpha (0.62f));
+    g.setFont (makeUIFont (6.6f, false));
+    const auto duration = detailAnalysisHistory.empty() ? 0.0 : detailAnalysisHistory.back().timeSeconds;
+    g.drawText (juce::String (detailAnalysisHistory.size()) + " frames  /  " + juce::String (duration, 1) + " sec",
+                header, juce::Justification::centredLeft);
+
+    if (detailAnalysisHistory.size() < 2)
+        return;
+
+    auto content = panel.reduced (24, 42).toFloat();
+    g.saveState();
+    g.reduceClipRegion (content.toNearestInt());
+
+    const auto highlightColour = kButtonTerracottaMuted.brighter (0.18f);
+    const float rowHeight = content.getHeight() / 6.0f;
+    const auto count = detailAnalysisHistory.size();
+    const bool hasStereoPan = std::any_of (detailAnalysisHistory.begin(), detailAnalysisHistory.end(),
+                                           [] (const auto& frame) { return frame.stereoPanAvailable; });
+
+    g.setColour (kDetailDivider);
+    g.drawVerticalLine ((int) std::round (content.getX() + 92.0f),
+                        content.getY(),
+                        content.getBottom());
+    g.drawVerticalLine ((int) std::round (content.getRight() - 72.0f),
+                        content.getY(),
+                        content.getBottom());
+
+    const auto descriptorName = [] (int row) {
+        const juce::String names[] = { "CENTROID", "RMS", "FLUX", "SPREAD", "FLATNESS", "STEREO ENERGY" };
+        return names[juce::jlimit (0, 5, row)];
+    };
+
+    const auto normalisedValue = [] (int row, const DetailAnalysisFrame& frame) {
+        switch (row)
+        {
+        case 0:
+        {
+            const float hz = juce::jlimit (80.0f, 12000.0f, frame.centroidHz);
+            return std::log (hz / 80.0f) / std::log (12000.0f / 80.0f);
+        }
+        case 1:
+            return (juce::jlimit (-96.0f, 0.0f, frame.rmsDb) + 96.0f) / 96.0f;
+        case 2:
+            return juce::jlimit (0.0f, 1.0f, frame.spectralFlux);
+        case 3:
+            return juce::jlimit (0.0f, 1.0f, frame.spectralSpreadHz / 12000.0f);
+        case 4:
+            return juce::jlimit (0.0f, 1.0f, frame.spectralFlatness);
+        case 5:
+            return 0.5f * (juce::jlimit (-1.0f, 1.0f, frame.stereoPanEnergy) + 1.0f);
+        default:
+            return 0.0f;
+        }
+    };
+
+    const auto valueText = [] (int row, const DetailAnalysisFrame& frame, bool stereoAvailable) {
+        switch (row)
+        {
+        case 0:
+            return juce::String (frame.centroidHz, 0) + " Hz";
+        case 1:
+            return frame.rmsDb <= -119.0f ? juce::String ("-inf dB") : juce::String (frame.rmsDb, 1) + " dB";
+        case 2:
+            return juce::String (frame.spectralFlux, 3);
+        case 3:
+            return juce::String (frame.spectralSpreadHz, 0) + " Hz";
+        case 4:
+            return juce::String (frame.spectralFlatness, 3);
+        case 5:
+            if (! stereoAvailable)
+                return juce::String ("Mono");
+            if (frame.stereoPanEnergy < -0.04f)
+                return juce::String ("L ") + juce::String (std::abs (frame.stereoPanEnergy), 2);
+            if (frame.stereoPanEnergy > 0.04f)
+                return juce::String ("R ") + juce::String (frame.stereoPanEnergy, 2);
+            return juce::String ("Center");
+        default:
+            return juce::String();
+        }
+    };
+
+    for (int row = 0; row < 6; ++row)
+    {
+        auto rowArea = juce::Rectangle<float> (content.getX(), content.getY() + rowHeight * (float) row,
+                                               content.getWidth(), rowHeight);
+        if (row > 0)
+        {
+            g.setColour (kDetailDivider);
+            g.drawHorizontalLine ((int) rowArea.getY(), content.getX() + 12.0f, content.getRight() - 12.0f);
+        }
+
+        auto labelArea = rowArea.removeFromLeft (92.0f).reduced (12.0f, 0.0f);
+        auto latestArea = rowArea.removeFromRight (72.0f).reduced (4.0f, 0.0f);
+        auto graph = rowArea.reduced (0.0f, 6.0f);
+        graph = graph.withSizeKeepingCentre (graph.getWidth() * 0.52f, graph.getHeight());
+
+        g.setFont (makeUIFont (7.2f, true));
+        g.setColour (kTextPrimary.withAlpha (0.92f));
+        g.drawText (descriptorName (row), labelArea, juce::Justification::centredLeft);
+
+        g.setFont (makeUIFont (7.4f, false));
+        g.setColour (kTextPrimary);
+        g.drawFittedText (valueText (row, detailAnalysisHistory.back(), hasStereoPan), latestArea.toNearestInt(),
+                          juce::Justification::centredRight, 1);
+
+        const bool available = row != 5 || hasStereoPan;
+        if (! available)
+            continue;
+
+        g.setColour (juce::Colours::black.withAlpha (0.08f));
+        g.drawHorizontalLine ((int) std::round (graph.getCentreY()), graph.getX(), graph.getRight());
+
+        juce::Path path;
+        const auto maxDrawablePoints = juce::jmax (2, (int) graph.getWidth() * 2);
+        const auto step = juce::jmax ((size_t)1, count / (size_t) maxDrawablePoints);
+        bool started = false;
+        for (size_t index = 0; index < count; index += step)
+        {
+            const float time = (float) index / (float) (count - 1);
+            const float value = normalisedValue (row, detailAnalysisHistory[index]);
+            const float x = graph.getX() + time * graph.getWidth();
+            const float y = graph.getBottom() - value * graph.getHeight();
+            if (! started)
+            {
+                path.startNewSubPath (x, y);
+                started = true;
+            }
+            else
+                path.lineTo (x, y);
+        }
+
+        const float lastY =
+            graph.getBottom() - normalisedValue (row, detailAnalysisHistory.back()) * graph.getHeight();
+        path.lineTo (graph.getRight(), lastY);
+        g.setColour (kButtonTerracottaMuted);
+        g.strokePath (path, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        if (row != 5)
+            g.fillEllipse (juce::Rectangle<float> (3.0f, 3.0f).withCentre ({ graph.getRight(), lastY }));
+
+        if (analysisHoverTarget == row && analysisHoverFrameIndex < detailAnalysisHistory.size())
+        {
+            g.setColour (highlightColour.withAlpha (0.28f));
+            g.drawVerticalLine ((int) std::round (analysisHoverPoint.x), graph.getY(), graph.getBottom());
+            if (row != 5)
+            {
+                g.setColour (highlightColour);
+                g.fillEllipse (juce::Rectangle<float> (5.0f, 5.0f).withCentre (analysisHoverPoint));
+            }
+        }
+    }
+
+    if (analysisHoverTarget >= 0 && analysisHoverTarget < 6 && analysisHoverFrameIndex < detailAnalysisHistory.size())
+    {
+        const auto& frame = detailAnalysisHistory[analysisHoverFrameIndex];
+        const auto hoverText = descriptorName (analysisHoverTarget) + "  |  " + juce::String (frame.timeSeconds, 2) +
+                               " sec  |  " + valueText (analysisHoverTarget, frame, hasStereoPan);
+        const float tooltipWidth = juce::jmin (216.0f, content.getWidth() - 16.0f);
+        float tooltipX = analysisHoverPoint.x + 8.0f;
+        if (tooltipX + tooltipWidth > content.getRight() - 6.0f)
+            tooltipX = analysisHoverPoint.x - tooltipWidth - 8.0f;
+        const float tooltipY =
+            juce::jlimit (content.getY() + 5.0f, content.getBottom() - 25.0f, analysisHoverPoint.y - 24.0f);
+        auto tooltip = juce::Rectangle<float> (tooltipX, tooltipY, tooltipWidth, 20.0f);
+        g.setColour (kPanelBackground.withAlpha (0.96f));
+        g.fillRoundedRectangle (tooltip, kUnifiedCornerRadius);
+        g.setColour (kTextPrimary);
+        g.setFont (makeUIFont (7.2f, true));
+        g.drawFittedText (hoverText, tooltip.reduced (7.0f, 3.0f).toNearestInt(), juce::Justification::centredLeft, 1);
+    }
+
+    g.restoreState();
+}
+
+void AudioPluginAudioProcessorEditor::drawRelationalAnalysisPanel (juce::Graphics& g, juce::Rectangle<int> area)
+{
+    auto panel = area.reduced (8, 6);
+    g.setColour (kPanelUnderlayColour);
+    g.fillRoundedRectangle (panel.toFloat().expanded (2.0f), kUnifiedCornerRadius);
+    g.setColour (kLargePanelColour);
+    g.fillRoundedRectangle (panel.toFloat(), kUnifiedCornerRadius);
+
+    auto header = panel.reduced (14, 10).removeFromTop (kDetailHeaderHeight);
+    header.removeFromRight (kDetailDragWidth);
+    header.removeFromRight (12);
+    header.removeFromRight (kDetailTimeScaleWidth);
+    header.removeFromRight (14);
+
+    auto titleArea = header.removeFromLeft (128);
+    header.removeFromLeft (12);
+    g.setColour (kTextPrimary);
+    g.setFont (makeUIFont (11.8f, true));
+    g.drawText ("Relational View", titleArea, juce::Justification::centredLeft);
+
+    g.setColour (kTextSecondary.withAlpha (0.62f));
+    g.setFont (makeUIFont (6.6f, false));
+    const auto duration = detailAnalysisHistory.empty() ? 0.0 : detailAnalysisHistory.back().timeSeconds;
+    g.drawText (juce::String (detailAnalysisHistory.size()) + " frames  /  " + juce::String (duration, 1) + " sec",
+                header, juce::Justification::centredLeft);
+
+    if (detailAnalysisHistory.size() < 2)
+        return;
+
+    auto content = panel.reduced (24, 42).toFloat();
+    constexpr float panelGap = 24.0f;
+    const float panelWidth = (content.getWidth() - panelGap) * 0.5f;
+    const juce::Rectangle<float> relationPanels[] = {
+        { content.getX(), content.getY(), panelWidth, content.getHeight() },
+        { content.getX() + panelWidth + panelGap, content.getY(), panelWidth, content.getHeight() }
+    };
+    const auto traceColour = kSpectrogramLabel.withAlpha (0.72f);
+    const auto accentColour = kButtonTerracottaMuted.brighter (0.18f);
+    const auto count = detailAnalysisHistory.size();
+    const bool hasStereoPan = std::any_of (detailAnalysisHistory.begin(), detailAnalysisHistory.end(),
+                                           [] (const auto& frame) { return frame.stereoPanAvailable; });
+
+    g.setColour (kDetailDivider);
+    g.drawVerticalLine ((int) std::round (content.getCentreX()),
+                        content.getY(),
+                        content.getBottom());
+
+    for (int panelIndex = 0; panelIndex < 2; ++panelIndex)
+    {
+        const auto relationPanel = relationPanels[panelIndex];
+
+        auto title = relationPanel.reduced (14.0f, 8.0f).removeFromTop (18.0f);
+        g.setFont (makeUIFont (8.2f, true));
+        g.setColour (kTextPrimary);
+        g.drawText (panelIndex == 0 ? "RMS x SPECTRAL FLUX" : "SPREAD x STEREO ENERGY", title,
+                    juce::Justification::centredLeft);
+
+        auto graph = relationPanel.reduced (22.0f, 18.0f);
+        graph.removeFromTop (28.0f);
+        graph.removeFromBottom (18.0f);
+        graph.removeFromLeft (16.0f);
+
+        g.setColour (kSpectrogramLabel.withAlpha (0.10f));
+        g.drawHorizontalLine ((int) std::round (graph.getCentreY()), graph.getX(), graph.getRight());
+        g.drawVerticalLine ((int) std::round (graph.getCentreX()), graph.getY(), graph.getBottom());
+        g.setColour (kSpectrogramLabel.withAlpha (0.25f));
+        g.drawLine (graph.getX(), graph.getBottom(), graph.getRight(), graph.getBottom(), 0.8f);
+        g.drawLine (graph.getX(), graph.getY(), graph.getX(), graph.getBottom(), 0.8f);
+
+        g.setFont (makeUIFont (6.7f, false));
+        g.setColour (kTextPrimary.withAlpha (0.76f));
+        g.drawText (panelIndex == 0 ? "quiet" : "narrow",
+                    juce::Rectangle<float> (graph.getX(), graph.getBottom() + 2.0f, 46.0f, 12.0f),
+                    juce::Justification::centredLeft);
+        g.drawText (panelIndex == 0 ? "loud" : "wide",
+                    juce::Rectangle<float> (graph.getRight() - 46.0f, graph.getBottom() + 2.0f, 46.0f, 12.0f),
+                    juce::Justification::centredRight);
+        g.drawText (panelIndex == 0 ? "active" : "R",
+                    juce::Rectangle<float> (relationPanel.getX() + 3.0f, graph.getY() - 5.0f, 34.0f, 12.0f),
+                    juce::Justification::centred);
+        g.drawText (panelIndex == 0 ? "stable" : "L",
+                    juce::Rectangle<float> (relationPanel.getX() + 3.0f, graph.getBottom() - 7.0f, 34.0f, 12.0f),
+                    juce::Justification::centred);
+
+        if (panelIndex == 1 && ! hasStereoPan)
+        {
+            g.setColour (kTextPrimary.withAlpha (0.78f));
+            g.setFont (makeUIFont (8.0f, false));
+            g.drawText ("Mono input - stereo trajectory unavailable", graph.toNearestInt(),
+                        juce::Justification::centred);
+            continue;
+        }
+
+        juce::Path trajectory;
+        bool started = false;
+        juce::Point<float> startPoint;
+        juce::Point<float> endPoint;
+        const auto maxDrawablePoints = juce::jmax (2, (int) graph.getWidth() * 2);
+        const auto step = juce::jmax ((size_t)1, count / (size_t) maxDrawablePoints);
+
+        const auto pointForFrame = [panelIndex, graph] (const DetailAnalysisFrame& frame) {
+            const float xValue = panelIndex == 0 ? (juce::jlimit (-96.0f, 0.0f, frame.rmsDb) + 96.0f) / 96.0f
+                                                 : juce::jlimit (0.0f, 1.0f, frame.spectralSpreadHz / 12000.0f);
+            const float yValue = panelIndex == 0 ? juce::jlimit (0.0f, 1.0f, frame.spectralFlux)
+                                                 : 0.5f * (juce::jlimit (-1.0f, 1.0f, frame.stereoPanEnergy) + 1.0f);
+            return juce::Point<float> (graph.getX() + xValue * graph.getWidth(),
+                                       graph.getBottom() - yValue * graph.getHeight());
+        };
+
+        for (size_t index = 0; index < count; index += step)
+        {
+            const auto& frame = detailAnalysisHistory[index];
+            if (panelIndex == 1 && ! frame.stereoPanAvailable)
+                continue;
+
+            const auto point = pointForFrame (frame);
+            if (! started)
+            {
+                trajectory.startNewSubPath (point);
+                startPoint = point;
+                started = true;
+            }
+            else
+                trajectory.lineTo (point);
+            endPoint = point;
+        }
+
+        const auto& lastFrame = detailAnalysisHistory.back();
+        if (panelIndex == 0 || lastFrame.stereoPanAvailable)
+        {
+            endPoint = pointForFrame (lastFrame);
+            trajectory.lineTo (endPoint);
+        }
+
+        g.setColour (traceColour);
+        g.strokePath (trajectory,
+                      juce::PathStrokeType (1.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        g.setColour (kSpectrogramLabel.withAlpha (0.60f));
+        g.drawEllipse (juce::Rectangle<float> (5.0f, 5.0f).withCentre (startPoint), 0.9f);
+        g.setColour (accentColour);
+        g.fillEllipse (juce::Rectangle<float> (5.0f, 5.0f).withCentre (endPoint));
+
+        g.setFont (makeUIFont (6.4f, false));
+        g.setColour (kTextPrimary.withAlpha (0.72f));
+        g.drawText ("start", juce::Rectangle<float> (startPoint.x + 4.0f, startPoint.y - 8.0f, 32.0f, 12.0f),
+                    juce::Justification::centredLeft);
+        g.drawText ("now", juce::Rectangle<float> (endPoint.x + 4.0f, endPoint.y - 8.0f, 28.0f, 12.0f),
+                    juce::Justification::centredLeft);
+
+        if (analysisHoverTarget == 6 + panelIndex && analysisHoverFrameIndex < detailAnalysisHistory.size())
+        {
+            g.setColour (accentColour.withAlpha (0.18f));
+            g.fillEllipse (juce::Rectangle<float> (13.0f, 13.0f).withCentre (analysisHoverPoint));
+            g.setColour (accentColour);
+            g.fillEllipse (juce::Rectangle<float> (4.5f, 4.5f).withCentre (analysisHoverPoint));
+        }
+    }
+
+    if (analysisHoverTarget >= 6 && analysisHoverTarget <= 7 && analysisHoverFrameIndex < detailAnalysisHistory.size())
+    {
+        const auto& frame = detailAnalysisHistory[analysisHoverFrameIndex];
+        const bool isRmsFlux = analysisHoverTarget == 6;
+        const auto hoverText = juce::String (frame.timeSeconds, 2) + " sec  |  " +
+                               (isRmsFlux ? juce::String ("RMS ") + juce::String (frame.rmsDb, 1) + " dB  |  Flux " +
+                                                juce::String (frame.spectralFlux, 3)
+                                          : juce::String ("Spread ") + juce::String (frame.spectralSpreadHz, 0) +
+                                                " Hz  |  Stereo " + juce::String (frame.stereoPanEnergy, 2));
+        const float tooltipWidth = juce::jmin (230.0f, content.getWidth() * 0.5f - 14.0f);
+        const auto ownerPanel = relationPanels[analysisHoverTarget - 6];
+        float tooltipX = analysisHoverPoint.x + 8.0f;
+        if (tooltipX + tooltipWidth > ownerPanel.getRight() - 5.0f)
+            tooltipX = analysisHoverPoint.x - tooltipWidth - 8.0f;
+        const float tooltipY =
+            juce::jlimit (ownerPanel.getY() + 30.0f, ownerPanel.getBottom() - 25.0f, analysisHoverPoint.y - 24.0f);
+        auto tooltip = juce::Rectangle<float> (tooltipX, tooltipY, tooltipWidth, 20.0f);
+        g.setColour (kPanelBackground.withAlpha (0.96f));
+        g.fillRoundedRectangle (tooltip, kUnifiedCornerRadius);
+        g.setColour (kTextPrimary);
+        g.setFont (makeUIFont (7.0f, true));
+        g.drawFittedText (hoverText, tooltip.reduced (7.0f, 3.0f).toNearestInt(), juce::Justification::centredLeft, 1);
+    }
 }
 
 void AudioPluginAudioProcessorEditor::drawDetailAnalysisPanel (juce::Graphics& g, juce::Rectangle<int> area)
 {
-    auto panel = area.reduced (10, 8);
-    g.setColour (kPanelBackground.withAlpha (0.95f));
-    g.fillRoundedRectangle (panel.toFloat(), 16.0f);
+    auto panel = area.reduced (8, 6);
+    g.setColour (kPanelUnderlayColour);
+    g.fillRoundedRectangle (panel.toFloat().expanded (2.0f), kUnifiedCornerRadius);
+    g.setColour (kLargePanelColour);
+    g.fillRoundedRectangle (panel.toFloat(), kUnifiedCornerRadius);
 
-    auto header = panel.reduced (14, 10).removeFromTop (24);
-    header.removeFromRight (150); // Drag MIDI button
-    header.removeFromRight (10);
-    header.removeFromRight (180); // MIDI time-scale selector
+    auto header = panel.reduced (14, 10).removeFromTop (kDetailHeaderHeight);
+    header.removeFromRight (kDetailDragWidth);
     header.removeFromRight (12);
+    header.removeFromRight (kDetailTimeScaleWidth);
+    header.removeFromRight (14);
 
-    auto titleArea = header.removeFromLeft (108);
-    header.removeFromLeft (6);
+    auto titleArea = header.removeFromLeft (128);
+    header.removeFromLeft (12);
     auto summaryArea = header;
 
-    g.setColour (kSpectrogramLabel);
-    g.setFont (makeUIFont (12.0f, true));
+    g.setColour (kContrastBlush);
+    g.setFont (makeUIFont (11.8f, true));
     g.drawText ("Detail Analysis", titleArea, juce::Justification::centredLeft);
 
-    g.setFont (makeUIFont (8.0f, false));
+    g.setColour (kTextSecondary.withAlpha (0.62f));
+    g.setFont (makeUIFont (6.6f, false));
     const auto duration = detailAnalysisHistory.empty() ? 0.0 : detailAnalysisHistory.back().timeSeconds;
-    g.drawText (juce::String (detailAnalysisHistory.size()) + " frames  |  "
+    g.drawText (juce::String (detailAnalysisHistory.size()) + " frames  /  "
                 + juce::String (duration, 1) + " sec",
                 summaryArea,
                 juce::Justification::centredLeft);
 
     if (detailAnalysisHistory.empty())
     {
-        g.setColour (kSpectrogramLabel.withAlpha (0.70f));
+        g.setColour (kContrastBlush.withAlpha (0.74f));
         g.setFont (makeUIFont (10.0f, false));
         g.drawText ("Run Auto Mode, then Stop to unlock analysis.",
                     panel,
@@ -2375,29 +3880,49 @@ void AudioPluginAudioProcessorEditor::drawDetailAnalysisPanel (juce::Graphics& g
                                            detailAnalysisHistory.end(),
                                            [] (const auto& frame) { return frame.stereoPanAvailable; });
 
-    auto grid = panel.reduced (14, 42);
-    const int gap = 8;
-    const int cellWidth = (grid.getWidth() - gap * 2) / 3;
-    const int cellHeight = (grid.getHeight() - gap) / 2;
+    auto content = panel.reduced (24, 0);
+    content.removeFromTop (44);
+    content.removeFromBottom (40);
 
-    auto flatnessArea = juce::Rectangle<int> (grid.getX(), grid.getY(), cellWidth, cellHeight);
-    auto roughnessArea = juce::Rectangle<int> (grid.getX() + cellWidth + gap, grid.getY(), cellWidth, cellHeight);
-    auto fluxArea = juce::Rectangle<int> (grid.getX() + (cellWidth + gap) * 2,
-                                          grid.getY(),
-                                          cellWidth,
-                                          cellHeight);
-    auto centroidArea = juce::Rectangle<int> (grid.getX(),
-                                              grid.getY() + cellHeight + gap,
-                                              cellWidth,
-                                              cellHeight);
-    auto rmsArea = juce::Rectangle<int> (grid.getX() + cellWidth + gap,
-                                         grid.getY() + cellHeight + gap,
-                                         cellWidth,
-                                         cellHeight);
-    auto panArea = juce::Rectangle<int> (grid.getX() + (cellWidth + gap) * 2,
-                                         grid.getY() + cellHeight + gap,
-                                         cellWidth,
-                                         cellHeight);
+    constexpr int columnGap = 24;
+    constexpr int rowGap = 20;
+    const int rowHeight = (content.getHeight() - rowGap) / 2;
+    auto topRow = content.removeFromTop (rowHeight);
+    content.removeFromTop (rowGap);
+    auto bottomRow = content;
+
+    const auto splitIntoThreeColumns = [] (juce::Rectangle<int> row)
+    {
+        const int columnWidth = (row.getWidth() - columnGap * 2) / 3;
+        std::array<juce::Rectangle<int>, 3> columns;
+        columns[0] = row.removeFromLeft (columnWidth);
+        row.removeFromLeft (columnGap);
+        columns[1] = row.removeFromLeft (columnWidth);
+        row.removeFromLeft (columnGap);
+        columns[2] = row;
+        return columns;
+    };
+
+    const auto topColumns = splitIntoThreeColumns (topRow);
+    const auto bottomColumns = splitIntoThreeColumns (bottomRow);
+
+    const int firstDividerX = (topColumns[0].getRight() + topColumns[1].getX()) / 2;
+    const int secondDividerX = (topColumns[1].getRight() + topColumns[2].getX()) / 2;
+    const int middleDividerY = topRow.getBottom() + rowGap / 2;
+
+    g.setColour (kDetailDivider);
+    g.drawVerticalLine (firstDividerX, (float) topRow.getY(), (float) bottomRow.getBottom());
+    g.drawVerticalLine (secondDividerX, (float) topRow.getY(), (float) bottomRow.getBottom());
+    g.drawHorizontalLine (middleDividerY,
+                          (float) content.getX(),
+                          (float) content.getRight());
+
+    const auto flatnessArea = topColumns[0];
+    const auto spreadArea = topColumns[1];
+    const auto fluxArea = topColumns[2];
+    const auto centroidArea = bottomColumns[0];
+    const auto rmsArea = bottomColumns[1];
+    const auto panArea = bottomColumns[2];
 
     drawAnalysisCurve (g,
                        flatnessArea,
@@ -2409,13 +3934,13 @@ void AudioPluginAudioProcessorEditor::drawDetailAnalysisPanel (juce::Graphics& g
                        [] (const auto& frame) { return frame.spectralFlatness; });
 
     drawAnalysisCurve (g,
-                       roughnessArea,
-                       "Roughness",
-                       juce::String (latest.roughness, 3),
+                       spreadArea,
+                       "Spectral Spread",
+                       juce::String (latest.spectralSpreadHz, 0) + " Hz",
                        0.0f,
-                       1.0f,
+                       12000.0f,
                        true,
-                       [] (const auto& frame) { return frame.roughness; });
+                       [] (const auto& frame) { return frame.spectralSpreadHz; });
 
     drawAnalysisCurve (g,
                        fluxArea,
@@ -2456,49 +3981,47 @@ void AudioPluginAudioProcessorEditor::drawDetailAnalysisPanel (juce::Graphics& g
                        hasStereoPan,
                        [] (const auto& frame) { return frame.stereoPanEnergy; });
 
-    if (! hasStereoPan)
-    {
-        g.setColour (kSpectrogramLabel.withAlpha (0.48f));
-        g.setFont (makeUIFont (7.8f, false));
-        g.drawText ("Mono input - no stereo field",
-                    panArea.reduced (10, 30),
-                    juce::Justification::centred);
-    }
 }
 
 //==============================================================================
 void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (kEditorBackground);
+    drawImageCover (g, getEditorBackgroundImage(), getLocalBounds().toFloat());
+    g.fillAll (kBackgroundVeil);
 
     auto fullBounds = getLocalBounds();
-    auto bounds = fullBounds.reduced (12);
-    auto rightPanel = bounds.removeFromRight (206);
-    bounds.removeFromRight (12);
-    auto leftPanel = bounds;
+    auto bounds = getModuleBounds (fullBounds);
+    auto rightPanel = bounds.removeFromRight (kRightPanelWidth).translated (kRightColumnShift, 0);
+    bounds.removeFromRight (kMainColumnGap);
+    auto leftPanel = bounds.translated (-kLeftColumnShift, 0);
 
-    constexpr int spectrogramTopOffset = 36;
-    constexpr int spectrogramBottomGap = 12;
-    leftPanel.removeFromTop (spectrogramTopOffset);
-    auto spectroArea = leftPanel.removeFromTop ((int) std::round (leftPanel.getHeight() * 0.39f));
-    leftPanel.removeFromTop (spectrogramBottomGap);
-    auto scoreArea = leftPanel;
+    auto spectroArea = leftPanel.removeFromTop (getExpandedSpectrogramHeight (leftPanel.getHeight()));
+    leftPanel.removeFromTop (kSpectrogramBottomGap);
+    auto scoreArea = isDetailPageActive ? leftPanel : shrinkScoreArea (leftPanel);
 
-    auto titleArea = rightPanel.removeFromTop (44);
-    g.setColour (kTextPrimary);
-    g.setFont (makeTitleFont (30.0f));
-    auto buttonColumnBounds = freezeButton.getBounds()
-                                .getUnion (unfreezeButton.getBounds())
-                                .getUnion (resetButton.getBounds())
-                                .getUnion (quarterToneButton.getBounds())
-                                .getUnion (exportMidiButton.getBounds());
-    auto titleBounds = juce::Rectangle<int> (buttonColumnBounds.getX() - 12,
-                                             titleArea.getY(),
-                                             buttonColumnBounds.getWidth() + 24,
-                                             titleArea.getHeight());
-    g.drawText ("SPEKANA",
-                titleBounds,
-                juce::Justification::centred);
+    g.setColour (kSidebarUnderlayColour);
+    g.fillRoundedRectangle (rightPanel.toFloat().expanded (2.0f), kUnifiedCornerRadius);
+    g.setColour (kSidebarPanelColour);
+    g.fillRoundedRectangle (rightPanel.toFloat(), kUnifiedCornerRadius);
+
+    if (! isDetailPageActive)
+    {
+        const auto scorePanel = scoreArea.reduced (8, 6).toFloat();
+        g.setColour (kPanelUnderlayColour);
+        g.fillRoundedRectangle (scorePanel.expanded (2.0f), kUnifiedCornerRadius);
+        g.setColour (kLargePanelColour);
+        g.fillRoundedRectangle (scorePanel, kUnifiedCornerRadius);
+    }
+
+    auto titleArea = rightPanel.removeFromTop (kTitleAreaHeight);
+    const auto titleFont = makeTitleFont (26.0f);
+    drawTrackedText (g,
+                     "SPEKANA",
+                     titleArea.reduced (8, 0).toFloat(),
+                     titleFont,
+                     kTextPrimary.withAlpha (0.90f),
+                     titleFont.getHeight() * 0.02f);
 
     const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
 
@@ -2507,16 +4030,31 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
             transientStatusMessage.clear();
         }
 
-    auto rightInner = rightPanel.reduced (12);
-    auto bottomInfoArea = rightInner.removeFromBottom (54);
-    auto textArea = rightInner.removeFromBottom (148);
-    textArea.removeFromTop (30);
+    auto rightInner = rightPanel.reduced (kRightPanelInset);
+    auto bottomInfoArea = rightInner.removeFromBottom (kBottomInfoHeight);
+    auto textArea = rightInner.removeFromBottom (kPeakTextAreaHeight);
+
+    if (tuningSelector != nullptr)
+    {
+        const float separatorY = (float) tuningSelector->getY() - 7.0f;
+        g.setColour (kTextPrimary.withAlpha (0.10f));
+        g.drawHorizontalLine ((int) std::round (separatorY),
+                              (float) rightInner.getX() + 4.0f,
+                              (float) rightInner.getRight() - 4.0f);
+    }
 
     auto plotArea = spectroArea.reduced (8, 6);
 
-    g.setColour (kPanelBackground);
-    g.fillRoundedRectangle (plotArea.toFloat(), 14.0f);
+    g.setColour (kPanelUnderlayColour);
+    g.fillRoundedRectangle (plotArea.toFloat().expanded (2.0f), kUnifiedCornerRadius);
+    g.setColour (kLargePanelColour);
+    g.fillRoundedRectangle (plotArea.toFloat(), kUnifiedCornerRadius);
 
+    const auto spectrogramCanvas = plotArea.reduced (8);
+    g.setColour (kSpectrogramCanvasBackground);
+    g.fillRoundedRectangle (spectrogramCanvas.toFloat(), kUnifiedCornerRadius);
+
+    g.setOpacity (1.0f);
     g.drawImageWithin (spectrogramImage,
                        (int) plotArea.getX() + 8,
                        (int) plotArea.getY() + 8,
@@ -2569,19 +4107,45 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
             else
                 label << juce::String ((int) f) << " Hz";
 
-            g.setColour (kSpectrogramLabel);
+            g.setColour (kSpectrogramStaticLabel);
             g.drawFittedText (label, labelArea.toNearestInt(),
                               juce::Justification::centredLeft, 1);
             g.setColour (kSpectrogramLine);
+        }
+
+        if (spectrogramHoverActive && spectrogramHoverFrequencyHz >= minFreq
+            && spectrogramHoverFrequencyHz <= maxFreq)
+        {
+            const float hoverMel = hzToMel (spectrogramHoverFrequencyHz);
+            const float hoverNorm = juce::jlimit (0.0f, 1.0f, (hoverMel - melMin) / (melMax - melMin));
+            const float hoverY = graphBounds.getBottom() - hoverNorm * graphBounds.getHeight();
+
+            g.setColour (kSpectrogramLabel.withAlpha (0.58f));
+            g.drawLine ((float) graphBounds.getX(), hoverY,
+                        (float) graphBounds.getRight(), hoverY, 1.1f);
+
+            juce::String hoverLabel;
+            if (spectrogramHoverFrequencyHz >= 1000.0f)
+                hoverLabel << juce::String (spectrogramHoverFrequencyHz / 1000.0f, 2) << " kHz";
+            else
+                hoverLabel << juce::String ((int) std::round (spectrogramHoverFrequencyHz)) << " Hz";
+
+            auto hoverLabelArea = juce::Rectangle<float> (graphBounds.getX() + 4.0f,
+                                                          hoverY - 7.0f,
+                                                          64.0f,
+                                                          14.0f);
+            g.setColour (kAmberText);
+            g.drawFittedText (hoverLabel, hoverLabelArea.toNearestInt(),
+                              juce::Justification::centredLeft, 1);
         }
     }
 
     if (transientStatusMessage.isNotEmpty())
     {
         auto messageArea = plotArea.reduced (18, 12).removeFromBottom (24);
-        g.setColour (kButtonTerracotta.withMultipliedAlpha (0.20f));
-        g.fillRoundedRectangle (messageArea.toFloat(), 9.0f);
-        g.setColour (kSpectrogramLabel);
+        g.setColour (kButtonTerracotta.withAlpha (0.68f));
+        g.fillRoundedRectangle (messageArea.toFloat(), kUnifiedCornerRadius);
+        g.setColour (kAmberText);
         g.setFont (makeUIFont (8.2f, false));
         g.drawFittedText (transientStatusMessage,
                           messageArea.reduced (8, 4),
@@ -2590,39 +4154,44 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
     }
 
     if (isDetailPageActive)
-        drawDetailAnalysisPanel (g, scoreArea);
+    {
+        switch (detailViewMode)
+        {
+            case DetailViewMode::grid:        drawDetailAnalysisPanel (g, scoreArea); break;
+            case DetailViewMode::sparklines:  drawSparklineAnalysisPanel (g, scoreArea); break;
+            case DetailViewMode::relational:  drawRelationalAnalysisPanel (g, scoreArea); break;
+        }
+
+    }
 
     auto inner = textArea.reduced (2, 4);
 
     g.setColour (kTextPrimary);
-    g.setFont (makeUIFont (10.2f, true));
-    auto peaksTitleArea = inner.removeFromTop (20);
+    g.setFont (makeUIFont (12.2f, true));
+    auto peaksTitleArea = inner.removeFromTop (24);
     const int activePeakCount = getActivePeakCount();
     g.drawText ("Top " + juce::String (activePeakCount) + " Peaks",
                 peaksTitleArea,
                 juce::Justification::centredLeft);
 
-    g.setColour (kTextSecondary);
-    g.setFont (makeUIFont (8.4f, false));
-    g.drawText (useQuarterToneMode() ? "24-TET" : "12-TET",
-                peaksTitleArea,
-                juce::Justification::centredRight);
-
     inner.removeFromTop (2);
-    auto peakCountControlArea = inner.removeFromTop (20);
+    auto peakCountControlArea = inner.removeFromTop (24);
     g.setColour (kTextSecondary);
-    g.setFont (makeUIFont (7.4f, false));
+    g.setFont (makeUIFont (9.4f, false));
     g.drawText ("Count",
                 peakCountControlArea.removeFromLeft (36),
                 juce::Justification::centredLeft);
     inner.removeFromTop (4);
 
-    g.setFont (makeUIFont (7.8f, false));
+    g.setFont (makeUIFont (9.8f, false));
 
     const int numCols       = 2;
     const int rowsPerColumn = juce::jmax (1, (activePeakCount + numCols - 1) / numCols);
     const int colWidth   = inner.getWidth()  / numCols;
     const int lineHeight = inner.getHeight() / rowsPerColumn;
+
+    g.setColour (kTextPrimary.withAlpha (0.10f));
+    g.drawVerticalLine (inner.getCentreX(), (float) inner.getY() + 3.0f, (float) inner.getBottom() - 3.0f);
 
     for (int i = 0; i < activePeakCount; ++i)
     {
@@ -2635,105 +4204,122 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
         cell.setWidth  (colWidth);
         cell.setHeight (lineHeight);
 
-        float freq = topFreqsForDrawing[(size_t) i];
-        juce::String text = juce::String (i + 1) + ". ";
+        auto cellContent = cell.reduced (3, 1);
+        auto indexArea = cellContent.removeFromLeft (15);
+        auto noteArea = cellContent.removeFromLeft (25);
+        auto frequencyArea = cellContent;
+
+        g.setColour (kTextSecondary.withAlpha (0.66f));
+        g.setFont (makeUIFont (8.7f, false));
+        g.drawText (juce::String (i + 1), indexArea, juce::Justification::centredLeft);
+
+        const float freq = topFreqsForDrawing[(size_t) i];
 
         if (freq > 0.0f)
         {
-            auto noteName = freqToPitchName (freq, useQuarterToneMode());
-            text << noteName << "  " << juce::String (freq, 1) << " Hz";
+            g.setColour (kTextPrimary);
+            g.setFont (makeUIFont (9.8f, true));
+            g.drawFittedText (freqToPitchName (freq, useQuarterToneMode()),
+                              noteArea,
+                              juce::Justification::centredLeft,
+                              1);
+
+            g.setColour (kTextSecondary.withAlpha (0.86f));
+            g.setFont (makeUIFont (8.5f, false));
+            g.drawFittedText (juce::String (freq, 1) + " Hz",
+                              frequencyArea,
+                              juce::Justification::centredRight,
+                              1);
         }
         else
         {
-            text << "-";
+            g.setColour (kTextSecondary.withAlpha (0.44f));
+            g.setFont (makeUIFont (9.2f, false));
+            g.drawText ("-", noteArea.getUnion (frequencyArea), juce::Justification::centredLeft);
         }
-
-        g.setColour (kTextSecondary);
-        g.drawText (text,
-                    cell,
-                    juce::Justification::centredLeft);
     }
 
-    if (isAutoPageActive)
+    if (isAutoMode())
     {
-        auto autoReadoutArea = juce::Rectangle<int> (autoClearButton.getX() - 14,
-                                                     autoClearButton.getBottom() + 2,
-                                                     autoClearButton.getWidth() + 28,
-                                                     12);
-        const auto stateText = isAutoRunning ? juce::String ("Auto running")
-                                             : juce::String ("Auto stopped");
-        g.drawText (stateText + "  |  " + juce::String (autoCaptureCount) + " captures",
-                    autoReadoutArea,
-                    juce::Justification::centred);
+        auto autoReadoutArea = captureModeSelector != nullptr
+                                 ? captureModeSelector->getBounds()
+                                       .withY (autoClearButton.getBottom() + 2)
+                                       .withHeight (14)
+                                 : autoClearButton.getBounds().expanded (48, 0)
+                                       .withY (autoClearButton.getBottom() + 2)
+                                       .withHeight (14);
+        auto stateArea = autoReadoutArea;
+        auto captureArea = stateArea.removeFromRight (66);
+        auto dotArea = stateArea.removeFromLeft (12);
+        g.setColour ((isAutoRunning ? kButtonTerracottaMuted : kTextSecondary).withAlpha (0.92f));
+        g.fillEllipse ((float) dotArea.getCentreX() - 2.5f,
+                       (float) dotArea.getCentreY() - 2.5f,
+                       5.0f,
+                       5.0f);
+        g.setColour (kTextSecondary.withAlpha (0.90f));
+        g.setFont (makeUIFont (8.2f, false));
+        g.drawText (isAutoRunning ? "Capturing" : "Auto stopped",
+                    stateArea,
+                    juce::Justification::centredLeft);
+        g.drawText (juce::String (autoCaptureCount) + " captures",
+                    captureArea,
+                    juce::Justification::centredRight);
     }
 
-    auto infoArea = bottomInfoArea.reduced (0, 2);
-    infoArea.removeFromTop (6);
-    auto modeRow = infoArea.removeFromBottom (12);
-    g.setColour (kTextSecondary);
-    g.setFont (makeUIFont (7.4f, false));
-    g.drawText (bassBoostButton.getToggleState() ? "Analysis  |  Bass Boost On"
-                                                 : "Analysis  |  Original",
-                modeRow,
-                juce::Justification::centredRight);
+    auto statusBar = bottomInfoArea.reduced (0, 4);
+    g.setColour (kPanelTint.withAlpha (0.58f));
+    g.fillPath (makeOrganicCapsulePath (statusBar.toFloat(), 0.18f));
 
-    auto hostRow = infoArea.removeFromBottom (12);
-    g.setColour (kTextSecondary);
-    g.setFont (makeUIFont (7.6f, false));
     const auto inputLevelDb = processorRef.getInputLevelDb();
-    const auto inputLevelText = inputLevelDb <= -119.0f
-                              ? juce::String ("Input -inf dB")
-                              : "Input " + juce::String (inputLevelDb, 1) + " dB";
+    const juce::String inputText = inputLevelDb <= -119.0f
+                                     ? juce::String ("-inf")
+                                     : juce::String (inputLevelDb, 0) + "dB";
+    const auto statusText = juce::String ("LIVE");
 
-    g.drawText (inputLevelText + (useQuarterToneMode() ? "  |  24-TET"
-                                                       : "  |  12-TET"),
-                hostRow,
-                juce::Justification::centredRight);
+    auto liveArea = statusBar.removeFromLeft (47);
+    auto dotArea = liveArea.removeFromLeft (13);
+    g.setColour ((isAutoRunning || isFrozen ? kButtonTerracottaMuted : kTextSecondary).withAlpha (0.92f));
+    g.fillEllipse ((float) dotArea.getCentreX() - 2.7f,
+                   (float) dotArea.getCentreY() - 2.7f,
+                   5.4f,
+                   5.4f);
+    g.setColour (kTextPrimary);
+    g.setFont (makeUIFont (8.1f, true));
+    g.drawFittedText (statusText, liveArea, juce::Justification::centredLeft, 1);
 
-    auto firstFreezeRow = infoArea.removeFromBottom (12);
-    g.setColour (kTextSecondary);
-    g.setFont (makeUIFont (7.2f, false));
-    g.drawText (firstFreezeTimeLabel.isNotEmpty()
-                    ? "First Freeze: " + firstFreezeTimeLabel
-                    : "First Freeze: -",
-                firstFreezeRow,
-                juce::Justification::centredRight);
-
-    auto liveRow = infoArea.removeFromBottom (18);
-    auto statusPill = liveRow.removeFromRight (78);
-    const auto statusText = isAutoRunning ? juce::String ("AUTO")
-                                          : (isFrozen ? juce::String ("FROZEN") : juce::String ("LIVE"));
-    g.setColour ((isFrozen || isAutoRunning) ? kButtonTerracottaStrong
-                                             : kButtonTerracotta);
-    g.fillRoundedRectangle (statusPill.toFloat(), 8.0f);
-    g.setColour (kButtonText);
-    g.setFont (makeUIFont (8.6f, true));
-    g.drawText (statusText,
-                statusPill,
-                juce::Justification::centred);
+    const juce::String compactStatus[] { inputText,
+                                         useQuarterToneMode() ? "QUARTER" : "SEMI",
+                                         bassBoostButton.getToggleState() ? "BASS+" : "BASS-" };
+    const int statusWidths[] { 43, 44, statusBar.getWidth() - 87 };
+    g.setFont (makeUIFont (7.8f, false));
+    for (int index = 0; index < 3; ++index)
+    {
+        auto segment = statusBar.removeFromLeft (juce::jmax (1, statusWidths[index]));
+        g.setColour (index == 2 && bassBoostButton.getToggleState()
+                        ? kAmberText
+                        : kTextSecondary.withAlpha (0.90f));
+        g.drawFittedText (compactStatus[index], segment.reduced (2, 0), juce::Justification::centred, 1);
+    }
 }
 
 
 void AudioPluginAudioProcessorEditor::resized()
 {
     auto full = getLocalBounds();
-    auto bounds = full.reduced (12);
+    auto bounds = getModuleBounds (full);
 
-    auto rightPanel = bounds.removeFromRight (206);
-    bounds.removeFromRight (12);
-    auto leftPanel = bounds;
+    auto rightPanel = bounds.removeFromRight (kRightPanelWidth).translated (kRightColumnShift, 0);
+    bounds.removeFromRight (kMainColumnGap);
+    auto leftPanel = bounds.translated (-kLeftColumnShift, 0);
 
-    constexpr int spectrogramTopOffset = 36;
-    constexpr int spectrogramBottomGap = 12;
-    leftPanel.removeFromTop (spectrogramTopOffset);
-    auto spectroArea = leftPanel.removeFromTop ((int) std::round (leftPanel.getHeight() * 0.39f));
-    leftPanel.removeFromTop (spectrogramBottomGap);
-    auto scoreArea = leftPanel;
+    auto spectroArea = leftPanel.removeFromTop (getExpandedSpectrogramHeight (leftPanel.getHeight()));
+    leftPanel.removeFromTop (kSpectrogramBottomGap);
+    auto scoreArea = isDetailPageActive ? leftPanel : shrinkScoreArea (leftPanel);
 
     auto graphArea = spectroArea.reduced (16, 14);
     const int w = juce::jmax (1, graphArea.getWidth());
     const int h = juce::jmax (1, graphArea.getHeight());
-    spectrogramImage = juce::Image (juce::Image::RGB, w, h, true);
+    spectrogramImage = juce::Image (juce::Image::ARGB, w, h, true);
     clearSpectrogramImage();
 
     if (staffComponent != nullptr)
@@ -2744,10 +4330,10 @@ void AudioPluginAudioProcessorEditor::resized()
 
     if (descriptorMidiDragComponent != nullptr)
     {
-        auto detailHeader = scoreArea.reduced (10, 8).reduced (14, 10).removeFromTop (24);
-        const auto dragMidiBounds = detailHeader.removeFromRight (150);
-        detailHeader.removeFromRight (10);
-        const auto timeScaleBounds = detailHeader.removeFromRight (180);
+        auto detailHeader = scoreArea.reduced (8, 6).reduced (14, 10).removeFromTop (kDetailHeaderHeight);
+        const auto dragMidiBounds = detailHeader.removeFromRight (kDetailDragWidth);
+        detailHeader.removeFromRight (12);
+        const auto timeScaleBounds = detailHeader.removeFromRight (kDetailTimeScaleWidth);
         const bool showDetailControls = isDetailPageActive
                                      && hasCompletedAutoAnalysis
                                      && ! detailAnalysisHistory.empty()
@@ -2765,81 +4351,98 @@ void AudioPluginAudioProcessorEditor::resized()
         }
     }
 
-    rightPanel.removeFromTop (44);
-    auto rightInner = rightPanel.reduced (12);
-    rightInner.removeFromTop (10);
-    rightInner.removeFromBottom (54);
-    rightInner.removeFromBottom (148);
+    rightPanel.removeFromTop (kTitleAreaHeight);
+    auto rightInner = rightPanel.reduced (kRightPanelInset);
+    rightInner.removeFromTop (6);
+    rightInner.removeFromBottom (kBottomInfoHeight);
+    rightInner.removeFromBottom (kPeakTextAreaHeight);
     rightInner.removeFromBottom (8);
 
-    auto controlArea = rightInner.removeFromTop (182);
-    constexpr int buttonHeight = 26;
+    auto controlArea = rightInner;
+    if (captureModeSelector != nullptr)
+        captureModeSelector->setBounds (controlArea.removeFromTop (32));
+    controlArea.removeFromTop (8);
 
-    auto modeRow = controlArea.removeFromTop (24);
-    const int modeButtonWidth = (modeRow.getWidth() - 8) / 2;
-    manualModeButton.setBounds (modeRow.removeFromLeft (modeButtonWidth));
-    modeRow.removeFromLeft (8);
-    autoModeButton.setBounds (modeRow);
-    controlArea.removeFromTop (6);
-
-    auto placeButton = [&controlArea] (juce::TextButton& button,
-                                       int width,
-                                       int topTrim)
+    auto placeSecondaryPair = [&controlArea] (juce::TextButton& left,
+                                              juce::TextButton& right)
     {
-        controlArea.removeFromTop (topTrim);
-        auto row = controlArea.removeFromTop (buttonHeight);
-        auto x = row.getCentreX() - width / 2;
-        button.setBounds (x, row.getY(), width, buttonHeight);
+        auto row = controlArea.removeFromTop (22);
+        constexpr int gap = 8;
+        const int buttonWidth = (row.getWidth() - gap) / 2;
+        left.setBounds (row.removeFromLeft (buttonWidth));
+        row.removeFromLeft (gap);
+        right.setBounds (row);
     };
 
-    if (isAutoPageActive)
+    if (isAutoMode())
     {
-        placeButton (autoStartButton, 96, 0);
-        placeButton (autoStopButton, 96, 5);
-        placeButton (autoClearButton, 96, 5);
+        auto primaryRow = controlArea.removeFromTop (42);
+        autoStartButton.setBounds (primaryRow.withSizeKeepingCentre (94, 40));
+        controlArea.removeFromTop (4);
+        auto clearRow = controlArea.removeFromTop (20);
+        autoClearButton.setBounds (clearRow.withSizeKeepingCentre (68, 20));
+        controlArea.removeFromTop (25); // status readout is painted in this gap
 
-        controlArea.removeFromTop (16);
-        if (autoDetectionPad != nullptr)
-            autoDetectionPad->setBounds (controlArea.removeFromTop (48).reduced (5, 0));
-
-        quarterToneButton.setBounds (rightInner.getCentreX() - 65,
-                                     controlArea.getBottom() + 5,
-                                     130,
-                                     buttonHeight);
-        exportMidiButton.setBounds (rightInner.getCentreX() - 56,
-                                    quarterToneButton.getBottom() + 5,
-                                    112,
-                                    buttonHeight);
+        if (sensitivityControl != nullptr)
+            sensitivityControl->setBounds (controlArea.removeFromTop (45));
+        controlArea.removeFromTop (8);
     }
     else
     {
-        placeButton (freezeButton, 96, 0);
-        placeButton (unfreezeButton, 112, 5);
-        placeButton (resetButton, 84, 5);
-        placeButton (quarterToneButton, 130, 5);
-        placeButton (exportMidiButton, 112, 5);
+        auto primaryRow = controlArea.removeFromTop (42);
+        freezeButton.setBounds (primaryRow.withSizeKeepingCentre (94, 40));
+        controlArea.removeFromTop (4);
+        placeSecondaryPair (unfreezeButton, resetButton);
+        controlArea.removeFromTop (13);
     }
 
-    auto peakPanel = getLocalBounds().reduced (12).removeFromRight (206).reduced (12);
-    peakPanel.removeFromTop (44);
-    peakPanel.removeFromTop (10);
-    peakPanel.removeFromBottom (54);
-    auto peakTextArea = peakPanel.removeFromBottom (148);
-    peakTextArea.removeFromTop (30);
+    if (tuningSelector != nullptr)
+        tuningSelector->setBounds (controlArea.removeFromTop (30));
+    controlArea.removeFromTop (6);
+    exportMidiButton.setBounds (controlArea.removeFromTop (23));
+
+    auto peakPanel = getModuleBounds (getLocalBounds()).removeFromRight (kRightPanelWidth)
+                                                     .translated (kRightColumnShift, 0)
+                                                     .reduced (kRightPanelInset);
+    peakPanel.removeFromTop (kTitleAreaHeight);
+    peakPanel.removeFromBottom (kBottomInfoHeight);
+    auto peakTextArea = peakPanel.removeFromBottom (kPeakTextAreaHeight);
     auto peakInner = peakTextArea.reduced (2, 4);
-    peakInner.removeFromTop (22);
-    topPeakCountSlider.setBounds (peakInner.removeFromTop (20).withTrimmedLeft (36));
+    peakInner.removeFromTop (26);
+    topPeakCountSlider.setBounds (peakInner.removeFromTop (24).withTrimmedLeft (37).reduced (0, 2));
 
-    bassBoostButton.setBounds (scoreArea.getX() + 18,
-                               scoreArea.getBottom() - 38,
-                               112,
-                               buttonHeight);
+    const bool showDetailViews = isDetailPageActive
+                              && hasCompletedAutoAnalysis
+                              && ! detailAnalysisHistory.empty()
+                              && ! isAutoRunning;
+
+    constexpr int footerControlHeight = 40;
+    const int lowerControlY = scoreArea.getBottom() - 47;
+    if (showDetailViews)
+    {
+        detailAnalysisButton.setBounds (scoreArea.getX() + 19, lowerControlY, 190, footerControlHeight);
+        bassBoostButton.setVisible (false);
+
+        if (detailViewSelector != nullptr)
+        {
+            const int selectorX = detailAnalysisButton.getRight() + 8;
+            const int selectorWidth = juce::jmax (180, scoreArea.getRight() - 19 - selectorX);
+            detailViewSelector->setBounds (selectorX, lowerControlY, selectorWidth, footerControlHeight);
+            detailViewSelector->setVisible (true);
+            detailViewSelector->toFront (false);
+        }
+    }
+    else
+    {
+        bassBoostButton.setVisible (true);
+        bassBoostButton.setBounds (scoreArea.getX() + 19, lowerControlY, 150, footerControlHeight);
+        detailAnalysisButton.setBounds (bassBoostButton.getRight() + 12, lowerControlY, 190, footerControlHeight);
+
+        if (detailViewSelector != nullptr)
+            detailViewSelector->setVisible (false);
+    }
+
     bassBoostButton.toFront (false);
-
-    detailAnalysisButton.setBounds (bassBoostButton.getRight() + 10,
-                                    scoreArea.getBottom() - 38,
-                                    132,
-                                    buttonHeight);
     detailAnalysisButton.toFront (false);
 }
 
@@ -2875,8 +4478,16 @@ void AudioPluginAudioProcessorEditor::pushSpectrumToImage()
 
     const int x = width - 1;   // 新的一列在最右侧
 
-    const float minDb = -100.0f;
-    const float maxDb =   0.0f;
+    const float minDb = -96.0f;
+    const float maxDb =  -6.0f;
+    // JUCE's frequency-only FFT is unscaled. The Hann table is normalised to
+    // unity DC gain, so a bin-centred sine has a magnitude of N / 2. Convert
+    // that raw magnitude to peak-amplitude dBFS before applying the display
+    // range; otherwise typical signals exceed maxDb by roughly 60 dB and the
+    // entire spectrogram saturates at the hottest colour.
+    const float fftMagnitudeToDbfs = juce::Decibels::gainToDecibels (
+        2.0f / (float) kFftSize,
+        -120.0f);
 
     for (int y = 0; y < height; ++y)
     {
@@ -2891,6 +4502,8 @@ void AudioPluginAudioProcessorEditor::pushSpectrumToImage()
         float db = spectrumForDrawing[(size_t) bin];
         if (std::isnan (db) || std::isinf (db))
             db = minDb;
+        else
+            db += fftMagnitudeToDbfs;
 
         db = juce::jlimit (minDb, maxDb, db);
 
@@ -2904,7 +4517,7 @@ void AudioPluginAudioProcessorEditor::pushSpectrumToImage()
         for (int y = 0; y < height; ++y)
         {
             const auto baseColour = spectrogramImage.getPixelAt (x, y);
-            spectrogramImage.setPixelAt (x, y, baseColour.interpolatedWith (juce::Colours::white, 0.92f));
+            spectrogramImage.setPixelAt (x, y, baseColour.interpolatedWith (kFreezeMarker, 0.72f));
         }
 
         pendingFreezeMarker = false;
@@ -2916,13 +4529,33 @@ void AudioPluginAudioProcessorEditor::timerCallback()
 {
     processorRef.getSpectrumCopy (latestSpectrum);
     processorRef.getResidualCopy (latestResidual);
-    processorRef.getTopPeaksCopy (latestTopFreqs, latestTopMags);
+    processorRef.getTopPeaksCopy (latestTopFreqs,
+                                  latestTopMags,
+                                  latestTopPeakLevelsDbFs);
 
     spectrumForDrawing = latestSpectrum;
     topFreqsForDrawing = latestTopFreqs;
     topMagsForDrawing  = latestTopMags;
+    topPeakLevelsDbFsForDrawing = latestTopPeakLevelsDbFs;
 
     const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
+
+    // Start remains a deliberate user action. Once host playback has been
+    // observed, however, a Playing -> Stopped transition performs the same
+    // finalisation as the Stop button before a silent descriptor frame can be
+    // appended. Standalone operation has no host state and remains manual.
+    if (isAutoRunning && processorRef.hasHostTransportState())
+    {
+        const bool hostIsPlaying = processorRef.getHostTransportPlaying();
+
+        if (hostIsPlaying)
+            hasObservedHostPlaybackSinceAutoStart = true;
+        else if (hasObservedHostPlaybackSinceAutoStart && previousHostTransportPlaying)
+            finishAutoAnalysis (nowSeconds, "DAW transport stopped. Analysis complete.", false);
+
+        previousHostTransportPlaying = hostIsPlaying;
+    }
+
     recordDetailAnalysisFrame (nowSeconds);
     processAutoOnsetDetection (nowSeconds);
     pushSpectrumToImage();

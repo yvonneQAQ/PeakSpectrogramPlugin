@@ -19,6 +19,7 @@ One of its main intentions is to transform textured sound into usable MIDI mater
 - Quarter-tone notation using arrow accidentals in the score
 - `Freeze / Unfreeze / Reset` workflow for capturing chords over time
 - Embedded grand-staff score view
+- Absolute peak-level mapping to per-note MIDI velocity and score opacity
 - MIDI export from frozen chords and detailed descriptor analysis
 - Export time scaling at `*1`, `*2`, `*4`, `*5`, or `*10`
 - Live MIDI output from frozen chords

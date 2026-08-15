@@ -11,11 +11,15 @@ class AudioPluginAudioProcessor;
 class FrozenChordStaffComponent;
 class DescriptorMidiDragComponent;
 class MidiTimeScaleSelector;
-class AutoDetectionXYPad;
+class DetailViewSelector;
+class CaptureModeSelector;
+class TuningSelector;
+class SensitivityControl;
 
 struct FrozenChordSnapshot
 {
     std::array<float, AudioPluginAudioProcessor::kNumNoisyPeaks> freqsHz {};
+    std::array<float, AudioPluginAudioProcessor::kNumNoisyPeaks> partialIntensities {};
     juce::String label;
     bool useQuarterToneMode = false;
     double startTimeSeconds = 0.0;
@@ -30,6 +34,7 @@ struct DetailAnalysisFrame
     float roughness = 0.0f;
     float spectralFlux = 0.0f;
     float centroidHz = 0.0f;
+    float spectralSpreadHz = 0.0f;
     float rmsDb = -120.0f;
     float stereoPanEnergy = 0.0f;
     bool stereoPanAvailable = false;
@@ -44,15 +49,24 @@ public:
 
     void paint (juce::Graphics&) override;
     void resized() override;
+    void mouseMove (const juce::MouseEvent&) override;
+    void mouseExit (const juce::MouseEvent&) override;
     static constexpr int kNumNoisyPeaks = AudioPluginAudioProcessor::kNumNoisyPeaks;
 
 private:
+    enum class CaptureMode
+    {
+        Auto,
+        Manual
+    };
+
     bool useQuarterToneMode() const;
+    bool isAutoMode() const noexcept;
     int getActivePeakCount() const;
     juce::String getCurrentHostTimeLabel() const;
     juce::String formatTimeLabel (double seconds) const;
-    void setAutoPageActive (bool shouldUseAutoPage);
-    void refreshModeButtonStates();
+    void setCaptureMode (CaptureMode mode);
+    void refreshCaptureModeControls();
     void refreshAutoButtonStates();
     void resetAutoDetectorState();
     void finishAutoAnalysis (double nowSeconds,
@@ -61,7 +75,11 @@ private:
     void recordDetailAnalysisFrame (double nowSeconds);
     DetailAnalysisFrame calculateDetailAnalysisFrame (double nowSeconds);
     void refreshDetailAnalysisButtonState();
+    juce::Rectangle<float> getSpectrogramGraphBounds() const;
+    juce::Rectangle<float> getAlternateAnalysisBounds() const;
     void drawDetailAnalysisPanel (juce::Graphics& g, juce::Rectangle<int> area);
+    void drawSparklineAnalysisPanel (juce::Graphics& g, juce::Rectangle<int> area);
+    void drawRelationalAnalysisPanel (juce::Graphics& g, juce::Rectangle<int> area);
     void drawAnalysisCurve (juce::Graphics& g,
                             juce::Rectangle<int> area,
                             const juce::String& title,
@@ -97,6 +115,7 @@ private:
     std::array<float, kFftSize / 2> spectrumForDrawing { };
     std::array<float, kNumNoisyPeaks> topFreqsForDrawing { };
     std::array<float, kNumNoisyPeaks> topMagsForDrawing  { };
+    std::array<float, kNumNoisyPeaks> topPeakLevelsDbFsForDrawing { };
 
     // 🔹 后台最新分析结果（每帧更新，但不一定马上显示）
     std::array<float, kFftSize / 2>   latestSpectrum   { };
@@ -105,25 +124,25 @@ private:
     std::array<float, kFftSize / 2>   previousDetailSpectrum { };
     std::array<float, kNumNoisyPeaks> latestTopFreqs   { };
     std::array<float, kNumNoisyPeaks> latestTopMags    { };
+    std::array<float, kNumNoisyPeaks> latestTopPeakLevelsDbFs { };
 
 
-    juce::Image spectrogramImage { juce::Image::RGB, 400, 300, true };
+    juce::Image spectrogramImage { juce::Image::ARGB, 400, 300, true };
 
     bool isFrozen = false;
     juce::TextButton freezeButton { "Freeze" };
     juce::TextButton unfreezeButton { "Unfreeze" };
     juce::TextButton resetButton { "Reset" };
     juce::TextButton bassBoostButton { "Bass Boost" };
-    juce::TextButton quarterToneButton { "Quarter-Tone" };
     juce::TextButton exportMidiButton { "Export MIDI" };
-    juce::TextButton manualModeButton { "Manual" };
-    juce::TextButton autoModeButton { "Auto" };
     juce::TextButton autoStartButton { "Start" };
     juce::TextButton autoStopButton { "Stop" };
     juce::TextButton autoClearButton { "Clear" };
     juce::TextButton detailAnalysisButton { "Detail Analysis" };
     juce::Slider topPeakCountSlider;
-    std::unique_ptr<AutoDetectionXYPad> autoDetectionPad;
+    std::unique_ptr<CaptureModeSelector> captureModeSelector;
+    std::unique_ptr<TuningSelector> tuningSelector;
+    std::unique_ptr<SensitivityControl> sensitivityControl;
     std::unique_ptr<juce::FileChooser> exportFileChooser;
     std::unique_ptr<juce::LookAndFeel_V4> lookAndFeel;
 
@@ -131,17 +150,28 @@ private:
     std::unique_ptr<FrozenChordStaffComponent> staffComponent;
     std::unique_ptr<DescriptorMidiDragComponent> descriptorMidiDragComponent;
     std::unique_ptr<MidiTimeScaleSelector> midiTimeScaleSelector;
+    std::unique_ptr<DetailViewSelector> detailViewSelector;
     int freezeCaptureCount = 0;
     double activeFreezeSessionStartWallTimeSeconds = 0.0;
     double activeFreezeSessionOffsetSeconds = 0.0;
     juce::String firstFreezeTimeLabel;
-    bool isAutoPageActive = false;
+    CaptureMode currentMode = CaptureMode::Auto;
+    bool quarterToneMode = false;
     bool isDetailPageActive = false;
+    enum class DetailViewMode
+    {
+        grid,
+        sparklines,
+        relational
+    };
+    DetailViewMode detailViewMode = DetailViewMode::grid;
     bool isAutoRunning = false;
     bool hasPreviousAutoResidual = false;
     bool hasPreviousAutoInputLevel = false;
     bool hasPreviousDetailSpectrum = false;
     bool hasCompletedAutoAnalysis = false;
+    bool hasObservedHostPlaybackSinceAutoStart = false;
+    bool previousHostTransportPlaying = false;
     int autoCaptureCount = 0;
     double autoStartWallTimeSeconds = 0.0;
     double lastAutoOnsetWallTimeSeconds = -10.0;
@@ -150,6 +180,11 @@ private:
     float autoOnsetStrength = 0.0f;
     float previousAutoInputLevelDb = -120.0f;
     std::vector<DetailAnalysisFrame> detailAnalysisHistory;
+    int analysisHoverTarget = -1;
+    size_t analysisHoverFrameIndex = 0;
+    juce::Point<float> analysisHoverPoint;
+    bool spectrogramHoverActive = false;
+    float spectrogramHoverFrequencyHz = 0.0f;
     bool pendingFreezeMarker = false;
     juce::String transientStatusMessage;
     double transientStatusMessageExpirySeconds = 0.0;
